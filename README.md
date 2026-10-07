@@ -78,9 +78,28 @@ registrations that predate payload-magic declarations):
 | `0x7F` + `"FLAC"`                     | `flac`     |
 | `0x80` + `"theora"`                   | `theora`   |
 | `"Speex   "` (8 bytes incl. spaces)   | `speex`    |
+| `0x80` + `"kate\0\0\0"`               | `kate`     |
+| `"CMML\0\0\0\0"`                      | `cmml`     |
 
 All other streams are reported as `CodecId::new("unknown")` so the
 registry can still walk them; decode will fail for unregistered codecs.
+
+OGM ("Ogg Media", OggDS) streams are recognised before the registry is
+asked, by their stream headers (`0x01` + `"video"`, `"audio"`, `"text"`,
+or the pre-2003 `"Direct Show Samples embedded in Ogg"`), and read as
+FFmpeg 2da55bf's `oggparseogm.c` reads them (`src/ogm.rs`, MIT, with its
+notice): the header gives the media type, the codec (a FourCC or WAVE
+format tag, resolved through the registry's tag claims; `text` for
+subtitles), the size and the time base; each data packet loses its flag
+byte and length field, whose value becomes the packet's duration and
+whose bit 3 is the keyframe flag; a page's granule is the pts of the
+packet ending on it; and the headers end at the first packet without the
+low bit.
+
+Kate and CMML are subtitle streams (`src/timed_text.rs`). Their time base
+is the identification header's granule rate, and the pts of the packet
+ending on a page is the time its granule names: Kate's base plus offset,
+CMML's upper bits, split at the header's granule shift.
 
 One caveat comes from the container-registry factory signature, which
 only *lends* the resolver to `open`: a **chained** link whose BOS page
@@ -116,7 +135,8 @@ mis-scaling it by the sample rate.
 
 Each codec has a fixed number of header packets the demuxer absorbs
 before delivering content packets (Vorbis 3, Opus 2, Theora 3, Speex
-2). **FLAC** is the one mapping that declares its header-packet count
+2, CMML 3, OGM 2 or 1 for the old layout). Kate declares its count at
+byte 11 of its ID header. **FLAC** is the other mapping that declares its header-packet count
 in-band: per RFC 9639 §10.1 (`docs/audio/flac/rfc9639-flac.pdf`) the
 mapping packet's bytes 7..9 hold a big-endian "number of header packets
 (excluding the first)", so the total is `1 + that count`. The demuxer
