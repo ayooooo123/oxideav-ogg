@@ -4481,18 +4481,32 @@ fn parse_flac_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
 /// Build the per-codec setup blob ("CodecPrivate" in Matroska, "esds"-equivalent
 /// in MP4, etc.) from the header packets gathered out of an Ogg stream.
 ///
-/// - Vorbis / Theora: Xiph-laced concatenation of all 3 header packets
-///   (id, comment, setup) — one count byte (N-1) + Xiph-style sizes for the
-///   first N-1 packets + packets concatenated. This is the layout the
-///   corresponding decoders consume via `parse_xiph_extradata`.
+/// - Vorbis: Xiph-laced concatenation of all 3 header packets (id, comment,
+///   setup) — one count byte (N-1) + Xiph-style sizes for the first N-1
+///   packets + packets concatenated: FFmpeg's `oggparsevorbis.c` extradata,
+///   what the Vorbis decoder reads.
+/// - Theora: the 3 header packets each behind a big-endian 16-bit length:
+///   FFmpeg's `oggparsetheora.c` extradata, what the Theora decoder reads.
+///   A header too long for the length field keeps Xiph lacing.
 /// - Opus: just the OpusHead identification packet (OpusTags discarded).
 /// - Anything else: concatenate the headers and let the codec sort it out.
 fn build_codec_private(codec_id: &CodecId, packets: &[Vec<u8>]) -> Vec<u8> {
     match codec_id.as_str() {
-        "vorbis" | "theora" if packets.len() == 3 => xiph_lace_three(packets),
+        "vorbis" if packets.len() == 3 => xiph_lace_three(packets),
+        "theora" if packets.len() == 3 => length_prefixed(packets).unwrap_or_else(|| xiph_lace_three(packets)),
         "opus" => packets.first().cloned().unwrap_or_default(),
         _ => packets.iter().flatten().copied().collect(),
     }
+}
+
+/// Header packets each behind a big-endian 16-bit length, if every one fits.
+fn length_prefixed(packets: &[Vec<u8>]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(packets.iter().map(|p| p.len() + 2).sum());
+    for p in packets {
+        out.extend_from_slice(&u16::try_from(p.len()).ok()?.to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    Some(out)
 }
 
 /// Xiph-lace three header packets into the single-blob extradata format used

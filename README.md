@@ -391,9 +391,13 @@ mux.write_trailer()?;
 ```
 
 Per-stream header packets are reconstructed from each stream's
-`extradata`: for Vorbis and Theora the 3-packet sequence is parsed
-out of the Xiph-laced blob; for Opus the single `OpusHead` packet is
-augmented with a minimal empty `OpusTags` comment block.
+`extradata`: for Vorbis and Theora the 3-packet sequence is split out of
+either layout FFmpeg's `avpriv_split_xiph_headers` accepts — Xiph lacing
+(Matroska's CodecPrivate, the demuxer's Vorbis extradata) or each header
+behind a big-endian 16-bit length (the demuxer's Theora extradata, as
+FFmpeg's `oggparsetheora.c` builds it and Theora decoders read it); for
+Opus the single `OpusHead` packet is augmented with a minimal empty
+`OpusTags` comment block.
 
 A packet larger than one Ogg page — ≥ 65025 bytes laces to ≥ 256
 segments and a page holds at most 255 (RFC 3533 §6 field 4) — is
@@ -472,7 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut params = CodecParameters::audio(CodecId::new("vorbis"));
     params.channels = Some(2);
     params.sample_rate = Some(48_000);
-    // Vorbis/Theora carry their 3 header packets Xiph-laced in extradata.
+    // Vorbis carries its 3 header packets Xiph-laced in extradata.
     params.extradata =
         oxideav_ogg::mux::xiph_lace(&[&id_header, &comment_header, &setup_header]).unwrap();
     let streams = vec![StreamInfo {

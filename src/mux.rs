@@ -352,11 +352,11 @@ fn build_link_writers(
             _ => codec_id::header_packet_count(&s.params.codec_id),
         };
         // Theora: recover the granule-position packer from the ID header
-        // (the first packet of the Xiph-laced extradata blob). A stream
-        // whose extradata is missing or unparseable muxes with the
-        // legacy pts-as-raw-granule behaviour instead.
+        // (the first of the extradata's headers, in either layout). A stream
+        // whose extradata is missing or unparseable muxes with the legacy
+        // pts-as-raw-granule behaviour instead.
         let theora = if s.params.codec_id.as_str() == "theora" {
-            xiph_unlace(&s.params.extradata)
+            split_xiph_headers(&s.params.extradata, 42)
                 .and_then(|packets| packets.first().cloned())
                 .and_then(|id| TheoraIdHeader::parse(&id).ok())
                 .map(|id| TheoraMuxState {
@@ -1635,13 +1635,15 @@ fn extract_codec_headers(codec_id: &CodecId, extradata: &[u8]) -> Vec<Vec<u8>> {
         return Vec::new();
     }
     match codec_id.as_str() {
-        // Vorbis and Theora both store their 3-packet header sequence
-        // (identification, comment, setup) as a single Xiph-laced blob in
-        // `extradata` — the inverse of the demuxer's `xiph_lace_three`. Both
-        // must be split back into their constituent packets so each rides on
-        // the wire as a distinct Ogg packet; a Theora header blob muxed as one
-        // packet would be unparseable by a Theora decoder.
-        "vorbis" | "theora" => xiph_unlace(extradata).unwrap_or_default(),
+        // Vorbis and Theora store their 3-packet header sequence
+        // (identification, comment, setup) in `extradata`, as Xiph lacing
+        // (the demuxer's Vorbis form, Matroska's CodecPrivate) or each behind
+        // a big-endian 16-bit length (the demuxer's Theora form, FFmpeg's).
+        // Both must be split back into their constituent packets so each
+        // rides on the wire as a distinct Ogg packet; a Theora header blob
+        // muxed as one packet would be unparseable by a Theora decoder.
+        "vorbis" => split_xiph_headers(extradata, 30).unwrap_or_default(),
+        "theora" => split_xiph_headers(extradata, 42).unwrap_or_default(),
         "flac" => flac_header_packets(extradata).unwrap_or_else(|| vec![extradata.to_vec()]),
         "opus" => {
             // OpusHead followed by a synthetic minimal OpusTags. (Original
@@ -1655,6 +1657,28 @@ fn extract_codec_headers(codec_id: &CodecId, extradata: &[u8]) -> Vec<Vec<u8>> {
         }
         _ => vec![extradata.to_vec()],
     }
+}
+
+/// The three headers of Vorbis or Theora extradata in either layout FFmpeg's
+/// `avpriv_split_xiph_headers` accepts: big-endian 16-bit lengths when the
+/// first equals the identification header's size (`first_header_size`),
+/// else Xiph lacing (a leading 2).
+fn split_xiph_headers(extradata: &[u8], first_header_size: u16) -> Option<Vec<Vec<u8>>> {
+    let be16 = |at: usize| Some(u16::from_be_bytes([*extradata.get(at)?, *extradata.get(at + 1)?]));
+    if extradata.len() >= 6 && be16(0) == Some(first_header_size) {
+        let mut headers = Vec::with_capacity(3);
+        let mut at = 0usize;
+        for _ in 0..3 {
+            let len = usize::from(be16(at)?);
+            headers.push(extradata.get(at + 2..at + 2 + len)?.to_vec());
+            at += 2 + len;
+        }
+        return Some(headers);
+    }
+    if extradata.first() == Some(&2) {
+        return xiph_unlace(extradata);
+    }
+    None
 }
 
 /// The FLAC-in-Ogg header packets (RFC 9639 §10.1) for a FLAC stream
