@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opus end trimming as `Demuxer::packet_metadata().audio_trim` (48 kHz),
+  FFmpeg 2da55bf oggparseopus.c's `end_trimming`: a page's packets follow
+  on from the previous page's granule (the first data page's granule less
+  its packets' TOC durations); packets of the end-of-stream page ending
+  past its granule carry the excess, at most their duration, as padding.
+  Metadata clears before every read and seek; seeks re-anchor. Requires
+  the PearTube oxideav-core fork's `Demuxer::packet_metadata`.
+
+### Fixed
+
+- Opus streams declare the 48 kHz rate Opus decodes at, not OpusHead's
+  informational input rate (a decoder asked for 44.1 kHz output refused
+  the stream).
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.8...v0.1.9) - 2026-10-04
 
 ### Other

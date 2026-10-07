@@ -34,3 +34,8 @@ criterion = "0.5"
 [[bench]]
 name = "framing"
 harness = false
+
+# `Demuxer::packet_metadata` (per-packet audio trims) is in the PearTube
+# oxideav-core fork, not yet on crates.io.
+[patch.crates-io]
+oxideav-core = { git = "https://github.com/ayooooo123/oxideav-core", rev = "96094a916d8b9f2695f70bb0d53e5956b8a79847" }
