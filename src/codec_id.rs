@@ -50,6 +50,14 @@ pub fn detect(first_packet: &[u8]) -> CodecId {
     if first_packet.len() >= 8 && &first_packet[0..8] == b"Speex   " {
         return CodecId::new("speex");
     }
+    // Kate (https://wiki.xiph.org/OggKate): 0x80 + "kate\0\0\0".
+    if first_packet.starts_with(b"\x80kate\0\0\0") {
+        return CodecId::new("kate");
+    }
+    // CMML (https://wiki.xiph.org/CMML): "CMML\0\0\0\0".
+    if first_packet.starts_with(b"CMML\0\0\0\0") {
+        return CodecId::new("cmml");
+    }
     CodecId::new("unknown")
 }
 
@@ -75,6 +83,11 @@ pub fn header_packet_count(id: &CodecId) -> usize {
         // Theora and Speex have 3 and 2 header packets respectively.
         "theora" => 3,
         "speex" => 2,
+        // Kate declares its count in the ID header (see
+        // [`header_packet_count_from_first`]); the ID header is the least.
+        "kate" => 1,
+        // CMML: the ident header, the XML preamble and the `head` element.
+        "cmml" => 3,
         _ => 0,
     }
 }
@@ -93,8 +106,14 @@ pub fn header_packet_count(id: &CodecId) -> usize {
 /// mapping packet) and let per-packet metadata framing carry the rest. A
 /// packet too short to reach the field also falls back to `1`.
 ///
+/// Kate declares its count too, at byte 11 of the ID header (libkate's
+/// `doc/format.txt`: "num headers", the ID header included).
+///
 /// Every other codec ignores `first` and defers to [`header_packet_count`].
 pub fn header_packet_count_from_first(id: &CodecId, first: &[u8]) -> usize {
+    if id.as_str() == "kate" {
+        return crate::timed_text::kate_headers(first).unwrap_or(1);
+    }
     if id.as_str() == "flac" {
         // 0x7F "FLAC" (5) + 2-byte mapping version + 2-byte header-packet
         // count (big-endian) at bytes 7..9.
