@@ -297,6 +297,16 @@ Opus TOC parsing). The final packet on each page is also flagged
 `PacketFlags::unit_boundary` so a re-muxer can recreate similar page
 boundaries.
 
+**Opus** packets are timed from their TOC durations instead, as FFmpeg's
+`oggparseopus.c` times them: every packet's `pts`/`dts` is the granule it
+starts at less the pre-skip, the playback-time axis seeks use (above). The
+stream's first data packet carries the pre-skip as
+`PacketMetadata::audio_trim` skip (FFmpeg's `start_trimming`; re-armed when
+the headers are read again, not by a seek into the data), and the packets
+of the end-of-stream page that end past its granule carry that excess as
+padding. A consumer removes these after decoding, in place of the
+decoder's own pre-skip.
+
 `PacketFlags::keyframe` follows the granuleshift packing the Skeleton 4.0
 `fisbone\0` declares (`docs/container/ogg/ogg-skeleton-4.0.md`: the
 granuleshift is "the number of lower bits from the granulepos field that are
@@ -1701,4 +1711,7 @@ does not invoke `cargo bench`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE) — except the Opus timestamps and trims
+(`src/opus_trim.rs`), ported from FFmpeg and LGPL-2.1-or-later (see
+[LICENSE-LGPL](LICENSE-LGPL)); the crate as a whole is
+`MIT AND LGPL-2.1-or-later`.

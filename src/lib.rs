@@ -101,12 +101,19 @@
 //! packets + granule positions into page bytes, and
 //! [`framing::PacketAssembler`] / [`framing::pages_to_packets`] invert
 //! it.
+//!
+//! # License
+//!
+//! The upstream code is MIT. The Opus timestamps and trims (`opus_trim`) are
+//! ported from FFmpeg and are LGPL-2.1-or-later (see `LICENSE-LGPL` and the
+//! file's notice); the crate as a whole is `MIT AND LGPL-2.1-or-later`.
 
 pub mod codec_id;
 pub mod crc;
 pub mod demux;
 pub mod framing;
 pub mod mux;
+mod opus_trim;
 pub mod page;
 pub mod skeleton;
 pub mod theora;

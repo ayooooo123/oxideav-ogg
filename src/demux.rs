@@ -443,6 +443,9 @@ struct LogicalStream {
     /// durations of the packets ending on it) by each packet's TOC
     /// duration. `None` until that page, and again after a seek.
     opus_end: Option<i64>,
+    /// For Opus: the next data packet is the stream's first after its
+    /// headers, which skips the pre-skip (`opus_trim`). Not after a seek.
+    opus_first: bool,
 }
 
 /// Concrete Ogg demuxer state. Most callers should use the boxed
@@ -692,6 +695,31 @@ impl OggDemuxer {
             theora_granule: HashMap::new(),
             resolver: None,
         }
+    }
+
+    /// Reset packet state to read on from `offset`. The packets of an Opus
+    /// stream's end-of-stream page cannot be placed from that page alone:
+    /// its granule excludes the padding they carry. When the page at
+    /// `offset` is one, they start at the granule of the stream's page
+    /// before it ([`previous_granule`]); any other first page places its
+    /// own packets.
+    fn reset_at(&mut self, offset: u64) -> Result<()> {
+        self.page_queue.clear();
+        self.out_queue.clear();
+        let eos_serial = end_of_stream_serial(self.input.as_mut(), offset)?;
+        for (&serial, state) in &mut self.state_by_serial {
+            state.pending.clear();
+            state.granule_seen = 0;
+            state.opus_first = false;
+            state.opus_end = if eos_serial == Some(serial) && self.opus_pre_skip.contains_key(&serial) {
+                previous_granule(self.input.as_mut(), offset, serial)?
+            } else {
+                None
+            };
+        }
+        self.input.seek(SeekFrom::Start(offset))?;
+        self.eof_reached = false;
+        Ok(())
     }
 
     /// Shared `open` body: read the BOS section and the header pages,
@@ -1611,15 +1639,7 @@ impl OggDemuxer {
 
         // Re-seek to the earlier resume page and re-flush demuxer state so
         // forward reads start cleanly from the preroll pages.
-        self.input.seek(SeekFrom::Start(resume_off))?;
-        self.page_queue.clear();
-        self.out_queue.clear();
-        for state in self.state_by_serial.values_mut() {
-            state.pending.clear();
-            state.granule_seen = 0;
-            state.opus_end = None;
-        }
-        self.eof_reached = false;
+        self.reset_at(resume_off)?;
         self.preroll_seeks = self.preroll_seeks.saturating_add(1);
         Ok(landed_granule)
     }
@@ -2366,6 +2386,7 @@ impl OggDemuxer {
         // so the restarted occupant's BOS is treated as freshly seen.
         state.bos_processed = false;
         state.opus_end = None;
+        state.opus_first = true;
         true
     }
 
@@ -2558,6 +2579,7 @@ impl OggDemuxer {
                 bos_processed: false,
                 theora_next_frame: None,
                 opus_end: None,
+                opus_first: true,
             },
         );
         Ok(())
@@ -3281,6 +3303,7 @@ impl OggDemuxer {
             .map(|b| b.granuleshift as u32)
             .or(theora_gran.map(|g| g.shift))
             .unwrap_or(0);
+        let pre_skip = self.opus_pre_skip.get(&page.serial).copied().unwrap_or(0);
         let stream = self
             .state_by_serial
             .get_mut(&page.serial)
@@ -3456,17 +3479,14 @@ impl OggDemuxer {
                 stream.theora_next_frame = theora_frame.map(|f| f + data_count);
             }
         }
-        // Opus end trimming (FFmpeg 2da55bf oggparseopus.c): a page's packets
-        // follow on from the previous page's granule, or from the first
-        // data page's granule less its packets' TOC durations; the packets
-        // of the end-of-stream page that end past its granule carry that
-        // excess, at most their own duration, as padding. (The decoder
-        // applies the OpusHead pre-skip itself.)
-        let granule_ok = (0..=1i64 << 62).contains(&page.granule_position);
-        if opus && data_count > 0 && stream.opus_end.is_none() && granule_ok && !page.is_last() {
-            let page_duration: i64 =
-                completed[header_take..].iter().filter_map(|d| opus_packet_duration(d)).map(i64::from).sum();
-            stream.opus_end = Some(page.granule_position - page_duration);
+        // Opus timestamps and trims (`opus_trim`, from FFmpeg's oggparseopus.c).
+        if opus {
+            crate::opus_trim::begin_page(
+                &mut stream.opus_end,
+                page.granule_position,
+                page.is_last(),
+                &completed[header_take..],
+            );
         }
         for (i, data) in completed.into_iter().enumerate() {
             if stream.headers_remaining > 0 {
@@ -3528,18 +3548,20 @@ impl OggDemuxer {
                 };
                 (pts, keyframe)
             };
-            let mut trim = None;
-            if opus {
-                let duration = i64::from(opus_packet_duration(&data).unwrap_or(0));
-                let end = stream.opus_end.unwrap_or(0).saturating_add(duration);
-                stream.opus_end = Some(end);
-                if page.is_last() && granule_ok {
-                    let excess = end.saturating_sub(page.granule_position).min(duration);
-                    if excess > 0 {
-                        trim = Some(AudioTrim { skip_samples: 0, discard_padding: excess as u32, sample_rate: 48_000 });
-                    }
-                }
-            }
+            // Opus derives every packet's pts from its TOC durations
+            // (`opus_trim`), FFmpeg's timestamps.
+            let (pts, trim) = if opus {
+                crate::opus_trim::packet(
+                    &mut stream.opus_end,
+                    &mut stream.opus_first,
+                    pre_skip,
+                    &data,
+                    page.granule_position,
+                    page.is_last(),
+                )
+            } else {
+                (pts, None)
+            };
             let mut pkt = Packet::new(stream_idx, time_base, data);
             pkt.pts = pts;
             pkt.dts = pts;
@@ -3547,8 +3569,8 @@ impl OggDemuxer {
             pkt.flags.unit_boundary = is_last;
             self.out_queue.push_back((pkt, trim));
         }
-        if opus && data_count > 0 && granule_ok {
-            stream.opus_end = Some(page.granule_position);
+        if opus {
+            crate::opus_trim::end_page(&mut stream.opus_end, page.granule_position, data_count > 0);
         }
 
         // Track the most recently observed granule for debugging/analysis. Not
@@ -3612,6 +3634,65 @@ impl OggDemuxer {
         parse_codec_comment(&codec_id, &packets, &mut self.metadata);
     }
 }
+
+/// The serial of the page at `offset` when it is an end-of-stream page.
+fn end_of_stream_serial(input: &mut dyn ReadSeek, offset: u64) -> Result<Option<u32>> {
+    input.seek(SeekFrom::Start(offset))?;
+    let mut header = [0u8; 27];
+    match input.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    if header[..4] != page::CAPTURE_PATTERN || header[5] & 0x04 == 0 {
+        return Ok(None);
+    }
+    Ok(Some(u32::from_le_bytes(header[14..18].try_into().expect("4 bytes"))))
+}
+
+/// The granule of `serial`'s last page that ends by `offset`, searched
+/// backward over at most 1 MiB in windows that overlap by a page. The whole
+/// page, CRC included, must check out, so payload bytes cannot pass for one.
+fn previous_granule(input: &mut dyn ReadSeek, offset: u64, serial: u32) -> Result<Option<i64>> {
+    const MAX_PAGE: usize = 27 + 255 + 255 * 255;
+    const MAX_BACKWARD: u64 = 1 << 20;
+    let floor = offset.saturating_sub(MAX_BACKWARD);
+    let mut end = offset;
+    let mut bytes = vec![0u8; ((offset - floor).min((2 * MAX_PAGE) as u64)) as usize];
+    while end > floor {
+        let start = end.saturating_sub(bytes.len() as u64).max(floor);
+        let length = (end - start) as usize;
+        input.seek(SeekFrom::Start(start))?;
+        input.read_exact(&mut bytes[..length])?;
+        let window = &bytes[..length];
+        for at in (0..length.saturating_sub(26)).rev() {
+            let header = &window[at..at + 27];
+            if &header[..5] != b"OggS\0" || header[14..18] != serial.to_le_bytes() {
+                continue;
+            }
+            let granule = i64::from_le_bytes(header[6..14].try_into().expect("8 bytes"));
+            if !(0..=1i64 << 62).contains(&granule) {
+                continue;
+            }
+            let header_end = at + 27 + usize::from(header[26]);
+            let Some(lacing) = window.get(at + 27..header_end) else { continue };
+            let total = header_end + lacing.iter().map(|&n| usize::from(n)).sum::<usize>();
+            let Some(page) = window.get(at..total) else { continue };
+            let checksum = u32::from_le_bytes(header[22..26].try_into().expect("4 bytes"));
+            if crate::crc::compute_page_checksum(page) == Some(checksum) {
+                return Ok(Some(granule));
+            }
+        }
+        if start == floor {
+            break;
+        }
+        // A page that starts before this window can end anywhere in its first
+        // page's length.
+        end = start + MAX_PAGE as u64 - 1;
+    }
+    Ok(None)
+}
+
 
 /// Parse a logical bitstream's Vorbis-comment-style tags out of its captured
 /// header packets and append them to `out`. Shared by the open-time
@@ -3852,15 +3933,7 @@ impl Demuxer for OggDemuxer {
                 // `wanted_serial`. The returned granule still belongs
                 // to the requested stream's time base.
                 if self.verify_keypoint_landing(byte_offset, winning_serial) {
-                    self.input.seek(SeekFrom::Start(byte_offset))?;
-                    self.page_queue.clear();
-                    self.out_queue.clear();
-                    for state in self.state_by_serial.values_mut() {
-                        state.pending.clear();
-                        state.granule_seen = 0;
-                        state.opus_end = None;
-                    }
-                    self.eof_reached = false;
+                    self.reset_at(byte_offset)?;
                     self.skeleton_index_seeks = self.skeleton_index_seeks.saturating_add(1);
                     return Ok(returned_granule);
                 } else {
@@ -3904,15 +3977,7 @@ impl Demuxer for OggDemuxer {
         if let Some((g, off)) =
             self.index_floor_by(wanted_serial, target_key, |g| seek_key.key_of(g))
         {
-            self.input.seek(SeekFrom::Start(off))?;
-            self.page_queue.clear();
-            self.out_queue.clear();
-            for state in self.state_by_serial.values_mut() {
-                state.pending.clear();
-                state.granule_seen = 0;
-                state.opus_end = None;
-            }
-            self.eof_reached = false;
+            self.reset_at(off)?;
             // If `build_seek_index` ran, the index is dense and we know
             // there's no better page between `off` and the target —
             // return immediately. Otherwise (sparse index from incidental
@@ -4022,15 +4087,7 @@ impl Demuxer for OggDemuxer {
 
         // Seek the underlying input to the page boundary and flush all
         // buffered demuxer state so playback resumes cleanly.
-        self.input.seek(SeekFrom::Start(landed_off))?;
-        self.page_queue.clear();
-        self.out_queue.clear();
-        for state in self.state_by_serial.values_mut() {
-            state.pending.clear();
-            state.granule_seen = 0;
-            state.opus_end = None;
-        }
-        self.eof_reached = false;
+        self.reset_at(landed_off)?;
 
         Ok(landed_granule)
     }
@@ -4195,25 +4252,6 @@ fn opus_pre_skip(packet: &[u8]) -> Option<u16> {
         return None;
     }
     Some(u16::from_le_bytes([packet[10], packet[11]]))
-}
-
-/// The 48 kHz duration of an Opus packet from its TOC byte (RFC 6716
-/// §3.1): the configuration's frame length times the frame count (code 3
-/// counts in the second byte). `None` for an empty or truncated packet.
-fn opus_packet_duration(packet: &[u8]) -> Option<u32> {
-    let toc = *packet.first()?;
-    let config = u32::from(toc >> 3);
-    let frame = match config {
-        0..=11 => (960 * (config & 3)).max(480),
-        12..=15 => 480 << (config & 1),
-        _ => 120 << (config & 3),
-    };
-    let frames = match toc & 3 {
-        0 => 1,
-        1 | 2 => 2,
-        _ => u32::from(*packet.get(1)? & 0x3F),
-    };
-    Some(frame * frames)
 }
 
 fn parse_opus_id(p: &mut CodecParameters, packet: &[u8]) -> Result<()> {
