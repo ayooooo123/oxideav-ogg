@@ -80,6 +80,7 @@ registrations that predate payload-magic declarations):
 | `"Speex   "` (8 bytes incl. spaces)   | `speex`    |
 | `0x80` + `"kate\0\0\0"`               | `kate`     |
 | `"CMML\0\0\0\0"`                      | `cmml`     |
+| `"OVP80"` + `0x01`                    | `vp8`      |
 
 All other streams are reported as `CodecId::new("unknown")` so the
 registry can still walk them; decode will fail for unregistered codecs.
@@ -105,6 +106,21 @@ Kate and CMML are subtitle streams (`src/timed_text.rs`). Their time base
 is the identification header's granule rate, and the pts of the packet
 ending on a page is the time its granule names: Kate's base plus offset,
 CMML's upper bits, split at the header's granule shift.
+
+VP8 is read as FFmpeg 2da55bf's `oggparsevp8.c` reads it (`src/vp8.rs`,
+LGPL port): the stream-info header gives the size and the frame rate
+(the time base), the headers end at the first packet not starting `0x4F`,
+a page's first frame starts as many shown frames before the pts its
+granule names as the page holds, each packet lasts its frame header's
+show bit (an altref frame takes no time), and a frame header's key bit
+makes a keyframe.
+
+A chained Opus link that follows a file of one Opus stream with the same
+channel count goes on as that stream, as FFmpeg's `ogg_replace_stream`
+makes it: its packets keep the stream's index, its first packet starts
+where the earlier link's sound ended (the rest keep their spacing), and
+its pre-skip and end padding are its own. Other chained links are new
+streams.
 
 One caveat comes from the container-registry factory signature, which
 only *lends* the resolver to `open`: a **chained** link whose BOS page
@@ -140,7 +156,7 @@ mis-scaling it by the sample rate.
 
 Each codec has a fixed number of header packets the demuxer absorbs
 before delivering content packets (Vorbis 3, Opus 2, Theora 3, Speex
-2, CMML 3, OGM 2 or 1 for the old layout). Kate declares its count at
+2, CMML 3, OGM 2 or 1 for the old layout, VP8 2 or 1). Kate declares its count at
 byte 11 of its ID header. **FLAC** is the other mapping that declares its header-packet count
 in-band: per RFC 9639 §10.1 (`docs/audio/flac/rfc9639-flac.pdf`) the
 mapping packet's bytes 7..9 hold a big-endian "number of header packets

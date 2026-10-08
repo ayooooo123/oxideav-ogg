@@ -32,10 +32,14 @@ fn frame() -> Vec<u8> {
 }
 
 fn page(flags_byte: u8, granule: i64, seq: u32, packets: &[Vec<u8>]) -> Vec<u8> {
+    page_of(SERIAL, flags_byte, granule, seq, packets)
+}
+
+fn page_of(serial: u32, flags_byte: u8, granule: i64, seq: u32, packets: &[Vec<u8>]) -> Vec<u8> {
     Page {
         flags: flags_byte,
         granule_position: granule,
-        serial: SERIAL,
+        serial,
         seq_no: seq,
         lacing: packets.iter().flat_map(|p| lace(p.len())).collect(),
         data: packets.concat(),
@@ -151,4 +155,47 @@ fn seeking_onto_the_eos_page_keeps_its_padding() {
     assert_eq!(d.seek_to(0, 4200).unwrap(), 4512);
     assert_eq!(d.packet_metadata().audio_trim, None);
     assert_eq!(trims(&mut *d), [None, padding(600)]);
+}
+
+/// A chained link of Opus after a one-stream Opus link continues that
+/// stream, as FFmpeg's `ogg_replace_stream` does: its packets are stream 0's,
+/// the first goes out where the first link's sound ended (FFmpeg's running
+/// timestamp) and the rest keep their spacing, and its pre-skip and end
+/// padding are its own.
+#[test]
+fn a_chained_opus_link_continues_the_stream() {
+    let link = SERIAL + 1;
+    let second = [
+        page_of(link, flags::FIRST_PAGE, 0, 0, &[opus_head(100, 48_000)]),
+        page_of(link, 0, 0, 1, &[opus_tags()]),
+        page_of(link, 0, 100 + 2880, 2, &[frame(), frame(), frame()]),
+        page_of(link, flags::LAST_PAGE, 4300, 3, &[frame(), frame()]),
+    ]
+    .concat();
+    let mut d = open([stream(4512), second].concat());
+    let mut got = Vec::new();
+    loop {
+        match d.next_packet() {
+            Ok(p) => got.push((p.stream_index, p.pts, d.packet_metadata().audio_trim)),
+            Err(Error::Eof) => break,
+            Err(e) => panic!("demux: {e}"),
+        }
+    }
+    let skip = |n| Some(AudioTrim { skip_samples: n, discard_padding: 0, sample_rate: 48_000 });
+    assert_eq!(
+        got,
+        [
+            (0, Some(0), skip(312)),
+            (0, Some(960), None),
+            (0, Some(1920), None),
+            (0, Some(2880), None),
+            (0, Some(3840), padding(600)),
+            (0, Some(4200), skip(100)),
+            (0, Some(5160), None),
+            (0, Some(6120), None),
+            (0, Some(7080), None),
+            (0, Some(8040), padding(600)),
+        ]
+    );
+    assert_eq!(d.streams().len(), 1);
 }

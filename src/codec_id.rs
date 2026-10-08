@@ -58,6 +58,10 @@ pub fn detect(first_packet: &[u8]) -> CodecId {
     if first_packet.starts_with(b"CMML\0\0\0\0") {
         return CodecId::new("cmml");
     }
+    // VP8 (FFmpeg's oggparsevp8.c): "OVP80", then the stream-info type 1.
+    if first_packet.len() >= 6 && first_packet.starts_with(b"OVP80") && first_packet[5] == 1 {
+        return CodecId::new("vp8");
+    }
     CodecId::new("unknown")
 }
 
@@ -88,6 +92,9 @@ pub fn header_packet_count(id: &CodecId) -> usize {
         "kate" => 1,
         // CMML: the ident header, the XML preamble and the `head` element.
         "cmml" => 3,
+        // VP8: stream info, then an optional comment header; the first
+        // packet that is not a header ends them (the `Vp8` layout).
+        "vp8" => 2,
         _ => 0,
     }
 }

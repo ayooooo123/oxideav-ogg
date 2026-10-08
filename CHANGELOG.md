@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- VP8 in Ogg (`OVP80`), as FFmpeg 2da55bf's oggparsevp8.c reads it
+  (`src/vp8.rs`, LGPL port): a video stream with the stream-info header's
+  size and frame rate (the time base); a page's first frame starts as many
+  shown frames before the pts its granule names as the page holds, each
+  packet lasts its show bit (an altref frame takes no time), and a frame
+  header's key bit makes a keyframe. Before, the stream was Unknown.
+- A chained Opus link after a file of one Opus stream with the same
+  channel count continues that stream, as FFmpeg's `ogg_replace_stream`
+  does: same stream index, the first packet starting where the earlier
+  link's sound ended, its own pre-skip and end padding. Before, it was a
+  new stream mid-file, which players that picked the first stream never
+  played.
 - Opus end trimming as `Demuxer::packet_metadata().audio_trim` (48 kHz),
   FFmpeg 2da55bf oggparseopus.c's `end_trimming`: a page's packets follow
   on from the previous page's granule (the first data page's granule less

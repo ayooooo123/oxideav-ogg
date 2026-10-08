@@ -438,6 +438,9 @@ struct LogicalStream {
     /// granule (non-conformant; spec §A.2.2 requires one on every page
     /// where a packet finishes).
     theora_next_frame: Option<i64>,
+    /// For VP8: the pts of the next frame, counted on from the last page
+    /// whose granule anchored it (`vp8`).
+    vp8_next: Option<i64>,
     /// For Opus: the granule position the next data packet starts at,
     /// counted on from the first data page (its granule less the
     /// durations of the packets ending on it) by each packet's TOC
@@ -450,6 +453,27 @@ struct LogicalStream {
     layout: Layout,
     /// OGM audio cut without regard to frames (`ogm::audio_framer`).
     framer: Option<crate::audio_frames::Framer>,
+    /// A chained Opus link that continues the public stream of an earlier
+    /// link (FFmpeg's `ogg_replace_stream`), rather than adding a stream.
+    continues: bool,
+    /// Added to the link's timestamps so they go on from the earlier link.
+    pts_offset: i64,
+    /// For a continuing link before its first timed packet: where the
+    /// earlier link's sound ended, which that packet starts at.
+    continue_from: Option<i64>,
+}
+
+impl LogicalStream {
+    /// `pts` of this link's packet on the public stream's timeline. The
+    /// first timed packet of a continuing link goes out where the earlier
+    /// link ended (FFmpeg's running timestamp); the rest keep their spacing.
+    fn timeline(&mut self, pts: Option<i64>) -> Option<i64> {
+        if let (Some(end), Some(p)) = (self.continue_from, pts) {
+            self.pts_offset = end.saturating_sub(p);
+            self.continue_from = None;
+        }
+        pts.map(|p| p.saturating_add(self.pts_offset))
+    }
 }
 
 /// Packet and granule layouts this demuxer reads itself; `Plain` is Ogg's
@@ -462,6 +486,8 @@ enum Layout {
     Timed(crate::timed_text::Granule),
     /// OGM (`ogm`, FFmpeg's `oggparseogm.c`).
     Ogm,
+    /// VP8 (`vp8`, FFmpeg's `oggparsevp8.c`).
+    Vp8,
 }
 
 /// The layout of a stream identified as `id` from its BOS packet `first`.
@@ -469,6 +495,7 @@ fn timed_layout(id: &CodecId, first: &[u8]) -> Layout {
     let timing = match id.as_str() {
         "kate" => crate::timed_text::kate(first),
         "cmml" => crate::timed_text::cmml(first),
+        "vp8" => return Layout::Vp8,
         _ => None,
     };
     timing.map_or(Layout::Plain, |(_, granule)| Layout::Timed(granule))
@@ -662,6 +689,10 @@ pub struct OggDemuxer {
     /// stream's duration by `pre-skip / 48000` seconds (a non-Opus stream
     /// never has an entry here, so its granule passes through unchanged).
     opus_pre_skip: HashMap<u32, u16>,
+    /// Per public stream: where its sound has ended so far on its timeline
+    /// (the last granule less the pre-skip, plus the link's offset), where
+    /// a continuing chained link starts.
+    stream_end: HashMap<usize, i64>,
     /// Per-serial Theora granule-position codec, parsed from the
     /// identification header's `KFGSHIFT` + `VREV` fields at BOS time
     /// (`docs/video/theora/Theora.pdf` §6.2 / §A.2.3). Present only
@@ -718,6 +749,7 @@ impl OggDemuxer {
             damage_events: Vec::new(),
             damage_events_total: 0,
             opus_pre_skip: HashMap::new(),
+            stream_end: HashMap::new(),
             theora_granule: HashMap::new(),
             resolver: None,
         }
@@ -1323,9 +1355,12 @@ impl OggDemuxer {
         // O(n) over registered streams — n is the count of logical
         // bitstreams, which is small (typically 1..=4) even on multiplexed
         // files, so we don't bother building a reverse map.
+        // A chained Opus link continuing a stream shares its index; the
+        // stream's first link answers.
         self.state_by_serial
             .values()
-            .find(|s| self.streams[s.public_index].index == stream_index)
+            .filter(|s| self.streams[s.public_index].index == stream_index)
+            .min_by_key(|s| s.link_index)
             .map(|s| s.link_index)
     }
 
@@ -1341,7 +1376,8 @@ impl OggDemuxer {
     pub fn stream_serial(&self, stream_index: u32) -> Option<u32> {
         self.state_by_serial
             .iter()
-            .find(|(_, s)| self.streams[s.public_index].index == stream_index)
+            .filter(|(_, s)| self.streams[s.public_index].index == stream_index)
+            .min_by_key(|(_, s)| s.link_index)
             .map(|(serial, _)| *serial)
     }
 
@@ -1764,14 +1800,10 @@ impl OggDemuxer {
         self.seek_to(stream_index, keyframe_pts)
     }
 
-    /// Look up the requested stream's on-wire serial number.
+    /// Look up the requested stream's on-wire serial number: its first
+    /// link's, when chained Opus links continue the stream.
     fn serial_for_stream(&self, stream_index: u32) -> Option<u32> {
-        for (serial, state) in &self.state_by_serial {
-            if self.streams[state.public_index].index == stream_index {
-                return Some(*serial);
-            }
-        }
-        None
+        self.stream_serial(stream_index)
     }
 
     /// Per-track preroll for `serial`, read from its Skeleton fisbone.
@@ -2553,6 +2585,19 @@ impl OggDemuxer {
             if let Some(ps) = opus_pre_skip(first) {
                 self.opus_pre_skip.insert(bos_page.serial, ps);
             }
+            // FFmpeg's `ogg_replace_stream`: an Opus link that starts after
+            // the file's data did, in a file of one Opus stream with the same
+            // channel count (FFmpeg refuses a change), continues that stream.
+            // Its headers, pre-skip and padding are its own; the timeline goes
+            // on.
+            if self.next_link_index > 0
+                && self.streams.len() == 1
+                && self.streams[0].params.codec_id.as_str() == "opus"
+                && self.streams[0].params.channels == params.channels
+            {
+                self.insert_state(bos_page.serial, 0, headers, layout, true);
+                return Ok(());
+            }
         }
 
         // Theora carries the container mapping's granule-position codec
@@ -2597,6 +2642,13 @@ impl OggDemuxer {
                 Some(id) => TimeBase::new(id.frd as i64, id.frn as i64),
                 None => TimeBase::new(1, 1_000_000),
             },
+            // VP8: the stream-info header's frame rate, one tick a frame.
+            "vp8" => match crate::vp8::stream_info(first) {
+                Some(info) if info.frame_rate.0 > 0 && info.frame_rate.1 > 0 => {
+                    TimeBase::new(i64::from(info.frame_rate.1), i64::from(info.frame_rate.0))
+                }
+                _ => TimeBase::new(1, 1_000_000),
+            },
             // Kate and CMML: the identification header's granule rate.
             "kate" | "cmml" => {
                 let timing = if codec_id.as_str() == "kate" {
@@ -2633,6 +2685,12 @@ impl OggDemuxer {
             start_time: Some(0),
             params,
         });
+        self.insert_state(serial, public_index, headers, layout, false);
+    }
+
+    /// Per-serial state for a logical stream of public stream
+    /// `public_index`; `continues`: a chained link going on with it.
+    fn insert_state(&mut self, serial: u32, public_index: usize, headers: usize, layout: Layout, continues: bool) {
         self.state_by_serial.insert(
             serial,
             LogicalStream {
@@ -2646,10 +2704,14 @@ impl OggDemuxer {
                 pending_valid: false,
                 bos_processed: false,
                 theora_next_frame: None,
+                vp8_next: None,
                 opus_end: None,
                 opus_first: true,
                 layout,
                 framer: None,
+                continues,
+                pts_offset: 0,
+                continue_from: None,
             },
         );
     }
@@ -2927,8 +2989,9 @@ impl OggDemuxer {
     /// header packets and write it back to the stream's `CodecParameters`.
     fn populate_extradata(&mut self) {
         for state in self.state_by_serial.values() {
-            // OGM keeps the extradata its header gave (FFmpeg's).
-            if state.layout == Layout::Ogm {
+            // OGM keeps the extradata its header gave (FFmpeg's); a chained
+            // link continuing a stream leaves the open-time extradata alone.
+            if state.layout == Layout::Ogm || state.continues {
                 continue;
             }
             let codec_id = self.streams[state.public_index].params.codec_id.clone();
@@ -3324,6 +3387,11 @@ impl OggDemuxer {
             // `restart_serial_on_duplicate_bos` reset the flag, so this line
             // re-arms it for the restarted occupant.)
             if let Some(s) = self.state_by_serial.get_mut(&page.serial) {
+                // A continuing chained link starts where the earlier link's
+                // sound ended, which is known once its BOS page is read.
+                if s.continues && !s.bos_processed {
+                    s.continue_from = Some(self.stream_end.get(&s.public_index).copied().unwrap_or(0));
+                }
                 s.bos_processed = true;
             }
         } else if page.is_first() && is_skeleton_bos {
@@ -3581,11 +3649,33 @@ impl OggDemuxer {
                 &completed[header_take..],
             );
         }
+        // VP8 (`vp8`): the page's first frame starts as many shown frames
+        // before the pts its granule names as the page holds; on the
+        // end-of-stream page the count runs on from the page before.
+        let mut vp8_pts = None;
+        if stream.layout == Layout::Vp8 {
+            let frames = || completed.iter().filter(|p| !crate::vp8::is_header(p));
+            let anchored = page.granule_position >= 0
+                && frames().next().is_some()
+                && (!page.is_last() || stream.vp8_next.is_none());
+            vp8_pts = if anchored {
+                let shown: i64 = frames().map(|p| crate::vp8::duration(p)).sum();
+                Some(crate::vp8::granule_pts(page.granule_position).saturating_sub(shown))
+            } else {
+                stream.vp8_next
+            };
+        }
         for (i, mut data) in completed.into_iter().enumerate() {
             if stream.headers_remaining > 0 {
-                if stream.layout == Layout::Ogm && !crate::ogm::is_header(&data) {
+                let not_header = match stream.layout {
                     // FFmpeg ends OGM headers at the first packet without
-                    // the low bit, whatever their count.
+                    // the low bit, and VP8 headers at the first not starting
+                    // `OVP80`, whatever their count.
+                    Layout::Ogm => !crate::ogm::is_header(&data),
+                    Layout::Vp8 => !crate::vp8::is_header(&data),
+                    _ => false,
+                };
+                if not_header {
                     stream.headers_remaining = 0;
                     headers_just_completed = true;
                 } else {
@@ -3622,6 +3712,10 @@ impl OggDemuxer {
                 // Kate / CMML: the packet ending on the page starts at the
                 // time its granule names; every packet stands alone.
                 ((is_last && page.granule_position >= 0).then(|| timed.time(page.granule_position)), true)
+            } else if stream.layout == Layout::Vp8 {
+                let pts = vp8_pts;
+                vp8_pts = vp8_pts.map(|p| p.saturating_add(crate::vp8::duration(&data)));
+                (pts, crate::vp8::is_keyframe(&data))
             } else if stream.layout == Layout::Ogm {
                 // OGM (`granule_is_start`): the granule is the start of the
                 // packet ending on the page. The keyframe bit is read below.
@@ -3701,6 +3795,7 @@ impl OggDemuxer {
                     continue;
                 }
             }
+            let pts = stream.timeline(pts);
             let mut pkt = Packet::new(stream_idx, time_base, data);
             pkt.pts = pts;
             pkt.dts = pts;
@@ -3712,11 +3807,18 @@ impl OggDemuxer {
         if opus {
             crate::opus_trim::end_page(&mut stream.opus_end, page.granule_position, data_count > 0);
         }
+        if stream.layout == Layout::Vp8 && vp8_pts.is_some() {
+            stream.vp8_next = vp8_pts;
+        }
 
         // Track the most recently observed granule for debugging/analysis. Not
         // used to assign per-packet pts any more.
         if page.granule_position >= 0 {
             stream.granule_seen = page.granule_position;
+            if data_count > 0 {
+                let end = page.granule_position.saturating_sub(i64::from(pre_skip));
+                self.stream_end.insert(public_index, stream.pts_offset.saturating_add(end));
+            }
         }
         // Record this page's sequence number so the next page on this stream
         // can be checked for continuity (RFC 3533 §6 field 6 page loss).
@@ -3729,22 +3831,18 @@ impl OggDemuxer {
         // at open time and would otherwise leave the new stream with just
         // its identification packet in `extradata`.)
         if headers_just_completed {
-            self.populate_extradata_for(public_index);
-            self.populate_metadata_for(public_index);
+            self.populate_extradata_for(public_index, page.serial);
+            self.populate_metadata_for(public_index, page.serial);
         }
         Ok(())
     }
 
-    /// Rebuild `params.extradata` for a single stream from its accumulated
-    /// header packets. Used both during initial open and when a chained
-    /// stream's headers complete mid-file.
-    fn populate_extradata_for(&mut self, public_index: usize) {
+    /// Rebuild `params.extradata` for public stream `public_index` from the
+    /// header packets of `serial`, whose headers just completed. Used when
+    /// a chained stream's headers complete mid-file.
+    fn populate_extradata_for(&mut self, public_index: usize, serial: u32) {
         let codec_id = self.streams[public_index].params.codec_id.clone();
-        let header_packets: Vec<Vec<u8>> = match self
-            .state_by_serial
-            .values()
-            .find(|s| s.public_index == public_index)
-        {
+        let header_packets: Vec<Vec<u8>> = match self.state_by_serial.get(&serial) {
             // OGM keeps the extradata its header gave (FFmpeg's).
             Some(s) if s.layout != Layout::Ogm => s.header_packets.clone(),
             _ => return,
@@ -3755,20 +3853,18 @@ impl OggDemuxer {
         }
     }
 
-    /// Pull Vorbis-comment metadata out of the second header packet for the
-    /// given stream and append it to the demuxer's metadata list.
-    fn populate_metadata_for(&mut self, public_index: usize) {
+    /// Pull Vorbis-comment metadata out of `serial`'s header packets (it
+    /// belongs to public stream `public_index`) and append it to the
+    /// demuxer's metadata list.
+    fn populate_metadata_for(&mut self, public_index: usize, serial: u32) {
         let codec_id = self.streams[public_index].params.codec_id.clone();
         // Take the stream's full header-packet list — FLAC's comment block can
         // be in any post-mapping header packet, not just the second — so the
         // chained / mid-file path covers every mapping the open-time
         // `populate_metadata` does (previously only vorbis/opus/theora,
         // dropping a chained Speex or FLAC link's tags).
-        let header_packets: Option<(Layout, Vec<Vec<u8>>)> = self
-            .state_by_serial
-            .values()
-            .find(|s| s.public_index == public_index)
-            .map(|s| (s.layout, s.header_packets.clone()));
+        let header_packets: Option<(Layout, Vec<Vec<u8>>)> =
+            self.state_by_serial.get(&serial).map(|s| (s.layout, s.header_packets.clone()));
         let Some((layout, packets)) = header_packets else {
             return;
         };
@@ -4317,7 +4413,7 @@ fn guess_params(codec_id: &CodecId, first: &[u8]) -> Result<CodecParameters> {
         "vorbis" => CodecParameters::audio(codec_id.clone()),
         "opus" => CodecParameters::audio(codec_id.clone()),
         "flac" => CodecParameters::audio(codec_id.clone()),
-        "theora" => CodecParameters::video(codec_id.clone()),
+        "theora" | "vp8" => CodecParameters::video(codec_id.clone()),
         "speex" => CodecParameters::audio(codec_id.clone()),
         "kate" | "cmml" => CodecParameters::subtitle(codec_id.clone()),
         _ => {
@@ -4333,6 +4429,12 @@ fn guess_params(codec_id: &CodecId, first: &[u8]) -> Result<CodecParameters> {
         "speex" => parse_speex_id(&mut p, first)?,
         "flac" => parse_flac_id(&mut p, first)?,
         "theora" => parse_theora_id_params(&mut p, first),
+        "vp8" => {
+            if let Some(info) = crate::vp8::stream_info(first) {
+                p.width = Some(u32::from(info.width));
+                p.height = Some(u32::from(info.height));
+            }
+        }
         _ => {}
     }
     Ok(p)

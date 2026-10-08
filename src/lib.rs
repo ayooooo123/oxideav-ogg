@@ -123,6 +123,7 @@ pub mod skeleton;
 pub mod theora;
 mod timed_text;
 pub mod validate;
+mod vp8;
 
 use oxideav_core::ContainerRegistry;
 
