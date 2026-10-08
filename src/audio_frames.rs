@@ -86,17 +86,7 @@ impl Framer {
             if self.buf.len() - at < len {
                 break;
             }
-            let frame_start = self.base + at as u64;
-            while self.stamps.front().is_some_and(|&(_, end, _)| end <= frame_start) {
-                self.stamps.pop_front();
-            }
-            let pts = match self.stamps.front() {
-                Some(&(begin, _, pts)) if begin <= frame_start => {
-                    self.stamps.pop_front();
-                    Some(pts)
-                }
-                _ => None,
-            };
+            let pts = self.take_pts(self.base + at as u64);
             out.push(Frame { data: self.buf[at..at + len].to_vec(), pts, samples, sample_rate });
             at += len;
         }
@@ -104,6 +94,30 @@ impl Framer {
         self.base += at as u64;
         while self.stamps.front().is_some_and(|&(_, end, _)| end <= self.base) {
             self.stamps.pop_front();
+        }
+    }
+
+    /// The stream ended: a frame cut off by the end goes out as it is, as
+    /// FFmpeg's parsers flush their buffer (its decoders conceal it).
+    pub(crate) fn finish(&mut self) -> Option<Frame> {
+        let (_, samples, sample_rate) = self.header(&self.buf)?;
+        let pts = self.take_pts(self.base);
+        self.base += self.buf.len() as u64;
+        Some(Frame { data: std::mem::take(&mut self.buf), pts, samples, sample_rate })
+    }
+
+    /// The pts of a frame starting at stream offset `frame_start`: that of
+    /// the chunk it starts in, once.
+    fn take_pts(&mut self, frame_start: u64) -> Option<i64> {
+        while self.stamps.front().is_some_and(|&(_, end, _)| end <= frame_start) {
+            self.stamps.pop_front();
+        }
+        match self.stamps.front() {
+            Some(&(begin, _, pts)) if begin <= frame_start => {
+                self.stamps.pop_front();
+                Some(pts)
+            }
+            _ => None,
         }
     }
 

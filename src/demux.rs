@@ -3152,6 +3152,25 @@ impl OggDemuxer {
                     Some(p) => p,
                     None => {
                         self.eof_reached = true;
+                        // FFmpeg flushes its parsers at the end of the file.
+                        let mut flushed = false;
+                        for state in self.state_by_serial.values_mut() {
+                            let Some(frame) = state.framer.as_mut().and_then(|f| f.finish()) else { continue };
+                            let stream = &self.streams[state.public_index];
+                            let mut pkt = Packet::new(stream.index, stream.time_base, frame.data);
+                            pkt.pts = frame.pts;
+                            pkt.dts = frame.pts;
+                            pkt.duration = Some(
+                                TimeBase::new(1, i64::from(frame.sample_rate))
+                                    .rescale(i64::from(frame.samples), stream.time_base),
+                            );
+                            pkt.flags.keyframe = true;
+                            self.out_queue.push_back((pkt, None));
+                            flushed = true;
+                        }
+                        if flushed {
+                            continue;
+                        }
                         return Ok(None);
                     }
                 },

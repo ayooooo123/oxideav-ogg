@@ -343,8 +343,11 @@ fn ogm_ac3_chunks_play_as_whole_frames_like_ffmpegs_parser() {
         (frames[2].clone(), Some(1000), Some(1536)),
         // Starts at byte 384, inside the last chunk [300, 610).
         (frames[3].clone(), Some(3000), Some(1536)),
+        // At the end the parser flushes the cut-off frame, as FFmpeg's does
+        // (its decoder conceals it).
+        (frames[4][..128 - 30].to_vec(), None, Some(1536)),
     ];
-    assert_eq!(got, expected, "the truncated fifth frame never plays");
+    assert_eq!(got, expected);
 }
 
 #[test]
