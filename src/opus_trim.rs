@@ -66,7 +66,7 @@ pub(crate) fn packet(
         _ => 0,
     };
     let trim = (skip > 0 || padding > 0)
-        .then(|| AudioTrim { skip_samples: skip, discard_padding: padding as u32, sample_rate: 48_000 });
+        .then_some(AudioTrim { skip_samples: skip, discard_padding: padding as u32, sample_rate: 48_000 });
     (pts, trim)
 }
 

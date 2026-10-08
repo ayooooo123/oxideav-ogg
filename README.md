@@ -94,7 +94,12 @@ subtitles), the size and the time base; each data packet loses its flag
 byte and length field, whose value becomes the packet's duration and
 whose bit 3 is the keyframe flag; a page's granule is the pts of the
 packet ending on it; and the headers end at the first packet without the
-low bit.
+low bit. OggDS muxers cut AC-3 and MPEG audio without regard to frames,
+so those streams are rebuilt into whole frames (`src/audio_frames.rs`,
+frame sizes from A/52 and ISO/IEC 11172-3 / 13818-3), as FFmpeg's parsers
+rebuild them: bytes before a valid header are skipped, a chunk's pts goes
+to the first frame starting in it, each frame lasts its sample count, and
+a frame the stream ends inside never plays.
 
 Kate and CMML are subtitle streams (`src/timed_text.rs`). Their time base
 is the identification header's granule rate, and the pts of the packet

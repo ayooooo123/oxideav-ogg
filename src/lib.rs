@@ -110,6 +110,7 @@
 //! OGM mapping (`ogm`) is ported from FFmpeg's MIT-licensed `oggparseogm.c`
 //! and carries its notice.
 
+mod audio_frames;
 pub mod codec_id;
 pub mod crc;
 pub mod demux;

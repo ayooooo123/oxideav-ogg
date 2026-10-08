@@ -257,3 +257,20 @@ pub(crate) fn packet(data: &[u8]) -> Option<(usize, i64, bool)> {
 pub(crate) fn comment(packet: &[u8]) -> Option<&[u8]> {
     (packet.first() == Some(&3) && packet.len() > 8).then(|| &packet[7..packet.len() - 1])
 }
+
+/// The framer an OGM audio stream opening with `first` needs: FFmpeg's
+/// `ogm_header` parses every audio codec but AAC (`AVSTREAM_PARSE_FULL`),
+/// because OggDS muxers cut the codec's bytes without regard to frames.
+/// Only codecs whose frames can be rebuilt get one (`audio_frames`).
+pub(crate) fn audio_framer(first: &[u8]) -> Option<crate::audio_frames::Framer> {
+    let tag = if first.starts_with(OLD_MAGIC) {
+        let field = |at: usize| first.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        (field(96)? == 0x0558_9F81).then_some(())?;
+        u16::from_le_bytes([*first.get(124)?, *first.get(125)?])
+    } else if first.starts_with(b"\x01audio") {
+        hex_tag(first.get(9..13)?.try_into().ok()?)
+    } else {
+        return None;
+    };
+    crate::audio_frames::Framer::for_wave_tag(tag)
+}

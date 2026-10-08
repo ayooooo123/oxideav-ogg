@@ -239,7 +239,8 @@ fn ogm_text_and_video_streams_follow_ffmpegs_oggparseogm() {
     assert_eq!(text.params.codec_id.as_str(), "text");
     assert_eq!(text.time_base, TimeBase::new(1, 1000));
     assert!(d.metadata().contains(&("language".into(), "English".into())), "{:?}", d.metadata());
-    let got: Vec<(u32, Vec<u8>, Option<i64>, Option<i64>, bool)> = packets(d.as_mut())
+    type Seen = (u32, Vec<u8>, Option<i64>, Option<i64>, bool);
+    let got: Vec<Seen> = packets(d.as_mut())
         .into_iter()
         .map(|p| (p.stream_index, p.data, p.pts, p.duration, p.flags.keyframe))
         .collect();
@@ -288,4 +289,81 @@ fn ogm_rejects_zero_timing_and_drops_packets_shorter_than_their_length_field() {
     let mut d = open(bytes);
     let got: Vec<Vec<u8>> = packets(d.as_mut()).into_iter().map(|p| p.data).collect();
     assert_eq!(got, [b"ok\0".to_vec()]);
+}
+
+/// An OGM audio stream (WAVE tag `tag` in hex, 48 kHz) whose frames the
+/// muxer cut into `cuts` arbitrary chunks, as OggDS muxers do: the first
+/// two chunks on one page (granule 1000), the rest on the last (granule
+/// 3000).
+fn ogm_audio(tag: &[u8; 4], stream: &[u8], cuts: &[usize]) -> Vec<u8> {
+    const SERIAL: u32 = 5;
+    let id = ogm_header(b"audio", tag, 10_000_000, 48_000, &[2, 0, 1, 0, 0xC0, 0x5D, 0, 0]);
+    let mut chunks = Vec::new();
+    let mut at = 0;
+    for &end in cuts.iter().chain([stream.len()].iter()) {
+        chunks.push(ogm_packet(true, &[0, 6], &stream[at..end]));
+        at = end;
+    }
+    let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
+    [
+        page(SERIAL, flags::FIRST_PAGE, 0, 0, &[&id]),
+        page(SERIAL, 0, 0, 1, &[b"\x03audio\0\0"]),
+        page(SERIAL, 0, 1000, 2, &refs[..2]),
+        page(SERIAL, flags::LAST_PAGE, 3000, 3, &refs[2..]),
+    ]
+    .concat()
+}
+
+/// `n` AC-3 frames of 128 bytes (32 kbps at 48 kHz: frmsizecod 0, bsid 8),
+/// frame `i` filled with `i`.
+fn ac3_frames(n: u8) -> Vec<Vec<u8>> {
+    (0..n).map(|i| [&[0x0B, 0x77, 0, 0, 0x00, 0x40][..], &[i; 122]].concat()).collect()
+}
+
+#[test]
+fn ogm_ac3_chunks_play_as_whole_frames_like_ffmpegs_parser() {
+    // FFmpeg's ogm_header sets AVSTREAM_PARSE_FULL for non-AAC audio: the
+    // AC-3 parser rebuilds frames from the chunks. A chunk's pts (granule_is_start:
+    // only the packet ending a page has one) goes to the first frame starting
+    // in it; each frame lasts its 1536 samples.
+    let frames = ac3_frames(5);
+    let stream = frames.concat();
+    // Chunks [0, 200) and [200, 300) on the first page, [300, 640 - 30) and
+    // a cut-off last frame on the second.
+    let bytes = ogm_audio(b"2000", &stream[..640 - 30], &[200, 300]);
+    let mut d = open(bytes);
+    assert_eq!(d.streams()[0].params.media_type, MediaType::Audio);
+    assert_eq!(d.streams()[0].params.tag, Some(CodecTag::wave_format(0x2000)));
+    let got: Vec<(Vec<u8>, Option<i64>, Option<i64>)> =
+        packets(d.as_mut()).into_iter().map(|p| (p.data, p.pts, p.duration)).collect();
+    let expected: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = vec![
+        (frames[0].clone(), None, Some(1536)),
+        (frames[1].clone(), None, Some(1536)),
+        // Starts at byte 256, inside the page's last chunk [200, 300).
+        (frames[2].clone(), Some(1000), Some(1536)),
+        // Starts at byte 384, inside the last chunk [300, 610).
+        (frames[3].clone(), Some(3000), Some(1536)),
+    ];
+    assert_eq!(got, expected, "the truncated fifth frame never plays");
+}
+
+#[test]
+fn ogm_mpeg_audio_chunks_play_as_whole_frames() {
+    // MPEG-1 Layer II, 64 kbps, 48 kHz: 192-byte frames of 1152 samples,
+    // after three bytes of junk the parser skips.
+    let frames: Vec<Vec<u8>> = (0..3u8).map(|i| [&[0xFF, 0xFD, 0x44, 0xC0][..], &[i; 188]].concat()).collect();
+    let stream = [&[0x00, 0x11, 0x22][..], &frames.concat()].concat();
+    let mut d = open(ogm_audio(b"0050", &stream, &[100, 250]));
+    let got: Vec<(Vec<u8>, Option<i64>)> = packets(d.as_mut()).into_iter().map(|p| (p.data, p.duration)).collect();
+    let expected: Vec<(Vec<u8>, Option<i64>)> = frames.into_iter().map(|f| (f, Some(1152))).collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn ogm_pcm_chunks_pass_through() {
+    // PCM has no parser: chunks stay chunks.
+    let stream: Vec<u8> = (0..=255).collect();
+    let mut d = open(ogm_audio(b"0001", &stream, &[100, 200]));
+    let got: Vec<Vec<u8>> = packets(d.as_mut()).into_iter().map(|p| p.data).collect();
+    assert_eq!(got, [stream[..100].to_vec(), stream[100..200].to_vec(), stream[200..].to_vec()]);
 }

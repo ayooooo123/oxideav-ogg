@@ -448,6 +448,8 @@ struct LogicalStream {
     opus_first: bool,
     /// How the stream's packets and granules are read.
     layout: Layout,
+    /// OGM audio cut without regard to frames (`ogm::audio_framer`).
+    framer: Option<crate::audio_frames::Framer>,
 }
 
 /// Packet and granule layouts this demuxer reads itself; `Plain` is Ogg's
@@ -735,6 +737,9 @@ impl OggDemuxer {
             state.pending.clear();
             state.granule_seen = 0;
             state.opus_first = false;
+            if let Some(framer) = state.framer.as_mut() {
+                framer.reset();
+            }
             state.opus_end = if eos_serial == Some(serial) && self.opus_pre_skip.contains_key(&serial) {
                 previous_granule(self.input.as_mut(), offset, serial)?
             } else {
@@ -2372,11 +2377,9 @@ impl OggDemuxer {
         // is taken from the duplicate BOS's own first packet — a chained link
         // may legally reuse a serial for a *different* codec, so we must not
         // assume the original stream's header count still applies.
-        let (header_count, layout) = bos_page
-            .packet_segments()
-            .first()
-            .map(|seg| self.layout(codecs, &bos_page.data[seg.data.clone()]))
-            .unwrap_or((0, Layout::Plain));
+        let first = bos_page.packet_segments().first().map(|seg| bos_page.data[seg.data.clone()].to_vec());
+        let (header_count, layout) = first.as_deref().map_or((0, Layout::Plain), |first| self.layout(codecs, first));
+        let framer = first.as_deref().and_then(crate::ogm::audio_framer);
         // The `build_seek_index` header scan, when it has run, is the
         // authoritative file-wide source for the duplicate-serial tally
         // (it visits every page exactly once). Only the incremental
@@ -2409,6 +2412,7 @@ impl OggDemuxer {
         state.opus_end = None;
         state.opus_first = true;
         state.layout = layout;
+        state.framer = framer;
         true
     }
 
@@ -2532,6 +2536,9 @@ impl OggDemuxer {
                 }
             };
             self.add_stream(bos_page.serial, params, time_base, headers, layout);
+            if let Some(state) = self.state_by_serial.get_mut(&bos_page.serial) {
+                state.framer = crate::ogm::audio_framer(first);
+            }
             return Ok(());
         }
         let codec_id = self.identify_codec(codecs, first);
@@ -2642,6 +2649,7 @@ impl OggDemuxer {
                 opus_end: None,
                 opus_first: true,
                 layout,
+                framer: None,
             },
         );
     }
@@ -3655,6 +3663,24 @@ impl OggDemuxer {
                 data.drain(..start);
                 duration = Some(length);
                 keyframe = key;
+                if let Some(framer) = stream.framer.as_mut() {
+                    // FFmpeg's parser rebuilds whole frames (see `audio_frames`).
+                    let mut frames = Vec::new();
+                    framer.push(&data, pts, &mut frames);
+                    let n = frames.len();
+                    for (k, frame) in frames.into_iter().enumerate() {
+                        let mut pkt = Packet::new(stream_idx, time_base, frame.data);
+                        pkt.pts = frame.pts;
+                        pkt.dts = frame.pts;
+                        pkt.duration = Some(
+                            TimeBase::new(1, i64::from(frame.sample_rate)).rescale(i64::from(frame.samples), time_base),
+                        );
+                        pkt.flags.keyframe = true;
+                        pkt.flags.unit_boundary = is_last && k + 1 == n;
+                        self.out_queue.push_back((pkt, None));
+                    }
+                    continue;
+                }
             }
             let mut pkt = Packet::new(stream_idx, time_base, data);
             pkt.pts = pts;
