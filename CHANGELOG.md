@@ -38,10 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   padding as an audio trim, as FFmpeg's demuxer does, so playback ends where the
   page granule says; an unanchored end-of-stream page after a seek is anchored
   at the stream's previous page granule looked up lazily, matching the
-  uninterrupted timeline without padding shift; a seek onto a file whose only
-  data page is the end-of-stream page resumes with the first packet priming
-  before 0; and a seek to 0 resets to the start of the file so header packets
-  are not emitted as data packets.
+  uninterrupted timeline without padding shift, or placed from granule less
+  durations when the backward search window is exhausted; a seek onto a file
+  whose only data page is the end-of-stream page resumes with the first packet
+  priming before 0; and a seek to 0 resets to the start of the file without
+  bumping link count, recording duplicate serial damage, or emitting header
+  packets as data.
 
 ## [0.1.9](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.8...v0.1.9) - 2026-10-04
 

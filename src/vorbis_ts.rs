@@ -28,6 +28,7 @@
 //!   uninterrupted timeline without padding shift.
 //! - A zero granule places nothing either: it is the first page's, holding
 //!   the priming packet alone, or a broken file's, which FFmpeg distrusts.
+//!
 //! A short block does not say how long the block before it was, so when a
 //! page placed from its granule starts with a short block after a long one,
 //! that first packet's own start is off; the packets after it start right.
@@ -51,6 +52,8 @@ pub(crate) struct VorbisTs {
     end: Option<i64>,
     /// The next data packet is the stream's first.
     first: bool,
+    /// Backward lookup for an end-of-stream page exhausted the search window.
+    exhausted: bool,
 }
 
 impl VorbisTs {
@@ -109,6 +112,7 @@ impl VorbisTs {
             previous: blocksize[0],
             end: None,
             first: true,
+            exhausted: false,
         })
     }
 
@@ -169,7 +173,7 @@ impl VorbisTs {
         let padding = if is_eos_packet && places(page_granule) {
             start.and_then(|pts| {
                 let diff = pts + duration - page_granule;
-                (diff > 0).then_some(diff as u32)
+                (diff > 0).then_some(u32::try_from(diff).unwrap_or(u32::MAX))
             })
         } else {
             None
@@ -186,23 +190,69 @@ impl VorbisTs {
 
     /// A seek: the packets read next start at `resume` (where those of an
     /// end-of-stream page start), else where their page places them.
-    pub(crate) fn seek(&mut self, resume: Option<i64>) {
-        self.first = resume == Some(0);
-        self.end = resume.filter(|&g| g > 0);
+    pub(crate) fn seek(&mut self, resume: Option<PreviousGranule>) {
+        match resume {
+            Some(PreviousGranule::Found(g)) => {
+                self.first = false;
+                self.end = Some(g);
+                self.exhausted = false;
+            }
+            Some(PreviousGranule::StreamStart) => {
+                self.first = true;
+                self.end = None;
+                self.exhausted = false;
+            }
+            Some(PreviousGranule::Exhausted) => {
+                self.first = false;
+                self.end = None;
+                self.exhausted = true;
+            }
+            None => {
+                self.first = false;
+                self.end = None;
+                self.exhausted = false;
+            }
+        }
         self.previous = self.blocksize[0];
     }
+
     /// Whether this stream currently has no anchor for its timeline.
     pub(crate) fn is_unanchored(&self) -> bool {
-        self.end.is_none() && !self.first
+        self.end.is_none() && !self.first && !self.exhausted
     }
 
     /// Anchor an end-of-stream page at `resume`, the granule of the stream's
-    /// previous page. If there is no previous data page (0 or None), it is
-    /// the stream's only data page and resumes with priming before 0.
-    pub(crate) fn anchor_eos(&mut self, resume: Option<i64>) {
-        self.first = resume == Some(0) || resume.is_none();
-        self.end = resume.filter(|&g| g > 0);
+    /// previous page.
+    pub(crate) fn anchor_eos(&mut self, resume: PreviousGranule) {
+        match resume {
+            PreviousGranule::Found(g) => {
+                self.first = false;
+                self.end = Some(g);
+                self.exhausted = false;
+            }
+            PreviousGranule::StreamStart => {
+                self.first = true;
+                self.end = None;
+                self.exhausted = false;
+            }
+            PreviousGranule::Exhausted => {
+                self.first = false;
+                self.end = None;
+                self.exhausted = true;
+            }
+        }
     }
+}
+
+/// The outcome of looking up the granule of a stream's previous page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviousGranule {
+    /// A previous data page was found with this non-zero granule.
+    Found(i64),
+    /// Reached the start of the stream (no earlier data page; granule 0 or start of file).
+    StreamStart,
+    /// The backward search window was exhausted before reaching the stream's start.
+    Exhausted,
 }
 
 /// A granule that places packets: FFmpeg's Ogg demuxer treats negative and

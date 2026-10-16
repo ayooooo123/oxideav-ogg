@@ -14,6 +14,7 @@ use crate::codec_id;
 use crate::page::{self, Page};
 use crate::skeleton::{self, FisBone, FisHead, SkelIndex, Skeleton};
 use crate::theora::{TheoraGranule, TheoraIdHeader};
+use crate::vorbis_ts::PreviousGranule;
 
 /// Page budget for the `open()`-time header-collection wait
 /// ([`OggDemuxer::read_until_headers_collected`]). Guards against a
@@ -770,23 +771,47 @@ impl OggDemuxer {
     fn reset_at(&mut self, offset: u64) -> Result<()> {
         self.page_queue.clear();
         self.out_queue.clear();
-        let eos_serial = end_of_stream_serial(self.input.as_mut(), offset)?;
-        for (&serial, state) in &mut self.state_by_serial {
-            state.pending.clear();
-            state.granule_seen = 0;
-            state.opus_first = false;
-            if let Some(framer) = state.framer.as_mut() {
-                framer.reset();
+        if offset == 0 {
+            self.seen_nonbos_in_current_link = false;
+            self.next_link_index = 0;
+            for state in self.state_by_serial.values_mut() {
+                state.pending.clear();
+                state.pending_valid = false;
+                state.last_seq = None;
+                if !state.header_packets.is_empty() {
+                    state.headers_remaining = state.header_packets.len();
+                    state.header_packets.clear();
+                }
+                state.bos_processed = false;
+                state.opus_end = None;
+                state.opus_first = true;
+                state.vorbis = None;
+                if let Some(framer) = state.framer.as_mut() {
+                    framer.reset();
+                }
             }
-            let opus = self.opus_pre_skip.contains_key(&serial);
-            let resume = if eos_serial == Some(serial) && (opus || state.vorbis.is_some()) {
-                previous_granule(self.input.as_mut(), offset, serial)?
-            } else {
-                None
-            };
-            state.opus_end = if opus { resume } else { None };
-            if let Some(vorbis) = state.vorbis.as_mut() {
-                vorbis.seek(resume);
+        } else {
+            let eos_serial = end_of_stream_serial(self.input.as_mut(), offset)?;
+            for (&serial, state) in &mut self.state_by_serial {
+                state.pending.clear();
+                state.granule_seen = 0;
+                state.opus_first = false;
+                if let Some(framer) = state.framer.as_mut() {
+                    framer.reset();
+                }
+                let opus = self.opus_pre_skip.contains_key(&serial);
+                let resume = if eos_serial == Some(serial) && (opus || state.vorbis.is_some()) {
+                    Some(previous_granule(self.input.as_mut(), offset, serial)?)
+                } else {
+                    None
+                };
+                state.opus_end = match resume {
+                    Some(PreviousGranule::Found(g)) => Some(g),
+                    _ => None,
+                };
+                if let Some(vorbis) = state.vorbis.as_mut() {
+                    vorbis.seek(resume);
+                }
             }
         }
         self.input.seek(SeekFrom::Start(offset))?;
@@ -3678,8 +3703,9 @@ impl OggDemuxer {
             if let Some(timing) = stream.vorbis.as_mut() {
                 if timing.is_unanchored() {
                     let cur_pos = self.input.stream_position()?;
-                    let prev = previous_granule(self.input.as_mut(), self.current_page_offset, page.serial)?;
-                    self.input.seek(SeekFrom::Start(cur_pos))?;
+                    let prev = previous_granule(self.input.as_mut(), self.current_page_offset, page.serial);
+                    let _ = self.input.seek(SeekFrom::Start(cur_pos));
+                    let prev = prev?;
                     timing.anchor_eos(prev);
                 }
             }
@@ -3722,6 +3748,22 @@ impl OggDemuxer {
                     if stream.headers_remaining == 0 {
                         headers_just_completed = true;
                     }
+                    continue;
+                }
+            }
+            if stream.headers_remaining == 0 {
+                let is_header = if vorbis {
+                    data.starts_with(b"\x01vorbis")
+                        || data.starts_with(b"\x03vorbis")
+                        || data.starts_with(b"\x05vorbis")
+                } else if theora_gran.is_some() {
+                    data.starts_with(b"\x80theora")
+                        || data.starts_with(b"\x81theora")
+                        || data.starts_with(b"\x82theora")
+                } else {
+                    false
+                };
+                if is_header {
                     continue;
                 }
             }
@@ -3941,7 +3983,7 @@ fn end_of_stream_serial(input: &mut dyn ReadSeek, offset: u64) -> Result<Option<
 /// The granule of `serial`'s last page that ends by `offset`, searched
 /// backward over at most 1 MiB in windows that overlap by a page. The whole
 /// page, CRC included, must check out, so payload bytes cannot pass for one.
-fn previous_granule(input: &mut dyn ReadSeek, offset: u64, serial: u32) -> Result<Option<i64>> {
+fn previous_granule(input: &mut dyn ReadSeek, offset: u64, serial: u32) -> Result<PreviousGranule> {
     const MAX_PAGE: usize = 27 + 255 + 255 * 255;
     const MAX_BACKWARD: u64 = 1 << 20;
     let floor = offset.saturating_sub(MAX_BACKWARD);
@@ -3968,17 +4010,23 @@ fn previous_granule(input: &mut dyn ReadSeek, offset: u64, serial: u32) -> Resul
             let Some(page) = window.get(at..total) else { continue };
             let checksum = u32::from_le_bytes(header[22..26].try_into().expect("4 bytes"));
             if crate::crc::compute_page_checksum(page) == Some(checksum) {
-                return Ok(Some(granule));
+                if granule > 0 {
+                    return Ok(PreviousGranule::Found(granule));
+                } else {
+                    return Ok(PreviousGranule::StreamStart);
+                }
             }
         }
         if start == floor {
             break;
         }
-        // A page that starts before this window can end anywhere in its first
-        // page's length.
         end = start + MAX_PAGE as u64 - 1;
     }
-    Ok(None)
+    if floor == 0 {
+        Ok(PreviousGranule::StreamStart)
+    } else {
+        Ok(PreviousGranule::Exhausted)
+    }
 }
 
 /// A stream's comments: OGM's comment header, wherever it is among the
