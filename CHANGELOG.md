@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opus streams declare the 48 kHz rate Opus decodes at, not OpusHead's
   informational input rate (a decoder asked for 44.1 kHz output refused
   the stream).
+- Vorbis timestamps after a seek: an unanchored end-of-stream page places its
+  packets from its granule less their summed durations, as FFmpeg does, so
+  audio following a video seek landing in a multiplexed file receives
+  presentation timestamps; a seek onto a file whose only data page is the
+  end-of-stream page resumes with the first packet priming before 0; and a seek
+  to 0 resets to the start of the file so header packets are not emitted as
+  data packets.
 
 ## [0.1.9](https://github.com/OxideAV/oxideav-ogg/compare/v0.1.8...v0.1.9) - 2026-10-04
 

@@ -4246,6 +4246,11 @@ impl Demuxer for OggDemuxer {
             }
         }
 
+        if target_key <= 0 {
+            self.reset_at(0)?;
+            return Ok(0);
+        }
+
         // Fast path: if the seek index already has a `(granule, offset)`
         // entry whose mapped key is `<= target_key`, jump to it directly.
         // The remaining linear-tail scan below still runs to tighten the

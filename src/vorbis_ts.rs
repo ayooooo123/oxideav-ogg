@@ -18,16 +18,16 @@
 //! samples of the second start at 0.
 //! - A page's granule is where the samples of the last packet ending on it
 //!   end, so the packets of the next page follow on from it.
-//! - With no granule to follow on from (the first data page, and the first
-//!   page after a seek), a page's packets start at its granule less their
-//!   durations. The end-of-stream page's granule leaves out the padding of
-//!   its last packet, so that page places nothing: the stream's first
-//!   packet then starts as above, and after a seek the packets start at the
-//!   granule of the stream's page before it (the demuxer's
-//!   `previous_granule`).
+//! - With no granule to follow on from (the first data page, and after a
+//!   seek), a page's packets start at its granule less their durations.
+//!   On the stream's first page, an end-of-stream granule leaves out the
+//!   padding of its last packet, so that page places nothing: the
+//!   stream's first packet then starts as above. After a seek, if there is
+//!   a previous page granule ([`VorbisTs::seek`]) packets start there;
+//!   otherwise an unanchored end-of-stream page is placed from its granule
+//!   less its packets' durations, matching FFmpeg's post-seek timestamps.
 //! - A zero granule places nothing either: it is the first page's, holding
 //!   the priming packet alone, or a broken file's, which FFmpeg distrusts.
-//!
 //! A short block does not say how long the block before it was, so when a
 //! page placed from its granule starts with a short block after a long one,
 //! that first packet's own start is off; the packets after it start right.
@@ -139,7 +139,7 @@ impl VorbisTs {
     /// A page with `packets` (its completed data packets) begins: without a
     /// running end, its granule places them.
     pub(crate) fn begin_page(&mut self, granule: i64, eos: bool, packets: &[Vec<u8>]) {
-        if packets.is_empty() || self.end.is_some() || eos || !places(granule) {
+        if packets.is_empty() || self.end.is_some() || (eos && self.first) || !places(granule) {
             return;
         }
         let mut previous = self.previous;
@@ -173,8 +173,8 @@ impl VorbisTs {
     /// A seek: the packets read next start at `resume` (where those of an
     /// end-of-stream page start), else where their page places them.
     pub(crate) fn seek(&mut self, resume: Option<i64>) {
-        self.end = resume;
-        self.first = false;
+        self.first = resume == Some(0);
+        self.end = resume.filter(|&g| g > 0);
         self.previous = self.blocksize[0];
     }
 }
