@@ -121,6 +121,61 @@ fn ensure_theora_vorbis_fixture() -> PathBuf {
     path
 }
 
+fn ensure_vorbis_only_fixture() -> PathBuf {
+    let dir = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"))
+        .join("fixtures");
+    std::fs::create_dir_all(&dir).expect("create fixtures dir");
+    let path = dir.join("vorbis_6s.ogg");
+    if !path.exists() {
+        let status = Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100",
+                "-t",
+                "6",
+                "-c:a",
+                "libvorbis",
+            ])
+            .arg(&path)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success(), "ffmpeg fixture generation succeeded");
+    }
+    path
+}
+
+fn ffprobe_last_vorbis_packet_duration(path: &PathBuf) -> u32 {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "packet=pts,duration",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .expect("run ffprobe");
+    assert!(output.status.success(), "ffprobe succeeded");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let last_line = text.lines().filter(|l| !l.is_empty()).last().expect("last packet line");
+    let mut parts = last_line.split(',');
+    let _pts = parts.next().unwrap();
+    let dur: u32 = parts.next().unwrap().parse().unwrap();
+    dur
+}
+
 /// Finding 1: In a multiplexed file, seeking onto a video page before the Vorbis EOS page
 /// causes all Vorbis packets on that EOS page to be placed at the previous page's granule,
 /// matching uninterrupted playback.
@@ -329,4 +384,64 @@ fn finding_3_seek_to_0_does_not_emit_header_packets_as_data() {
     assert_eq!(pkt_theora.stream_index, 0);
     assert_eq!(pkt_theora.pts, fresh_theora.pts);
     assert_eq!(pkt_theora.data, fresh_theora.data);
+}
+
+/// Last Vorbis packet of a stream carries its end padding as an audio trim,
+/// equal to block duration minus ffprobe's last packet duration, both straight-through
+/// and after a seek into the last second.
+#[test]
+fn last_vorbis_packet_carries_end_padding_as_audio_trim() {
+    let files = [
+        (ensure_theora_vorbis_fixture(), 1u32, true), // Theora+Vorbis (Vorbis is stream 1)
+        (ensure_vorbis_only_fixture(), 0u32, false),  // Vorbis only (stream 0)
+    ];
+
+    for (path, vorbis_idx, has_video) in &files {
+        let ffprobe_dur = ffprobe_last_vorbis_packet_duration(path);
+        let expected_discard = 1024 - ffprobe_dur;
+        assert!(expected_discard > 0, "fixture must have positive end padding to verify trim");
+
+        // 1. Straight-through
+        let file = File::open(path).expect("open file");
+        let input: Box<dyn ReadSeek> = Box::new(file);
+        let mut d = oxideav_ogg::demux::open(input, &NullCodecResolver).unwrap();
+        let mut trims = Vec::new();
+        while let Ok(pkt) = d.next_packet() {
+            if pkt.stream_index == *vorbis_idx {
+                trims.push(d.packet_metadata().audio_trim);
+            }
+        }
+        assert!(!trims.is_empty());
+        let last_trim = trims.pop().unwrap();
+        for (i, t) in trims.iter().enumerate() {
+            assert!(t.is_none(), "intermediate packet {i} must have no trim");
+        }
+        let last_trim = last_trim.expect("last Vorbis packet must carry AudioTrim");
+        assert_eq!(last_trim.skip_samples, 0);
+        assert_eq!(last_trim.discard_padding, expected_discard);
+
+        // 2. After a seek into the last second
+        let file = File::open(path).expect("open file");
+        let input: Box<dyn ReadSeek> = Box::new(file);
+        let mut d = oxideav_ogg::demux::open(input, &NullCodecResolver).unwrap();
+        if *has_video {
+            d.seek_to(0, 144).unwrap(); // seek onto video page
+        } else {
+            d.seek_to(0, 242550).unwrap(); // seek onto audio
+        }
+        let mut seek_trims = Vec::new();
+        while let Ok(pkt) = d.next_packet() {
+            if pkt.stream_index == *vorbis_idx {
+                seek_trims.push(d.packet_metadata().audio_trim);
+            }
+        }
+        assert!(!seek_trims.is_empty());
+        let last_seek_trim = seek_trims.pop().unwrap();
+        for (i, t) in seek_trims.iter().enumerate() {
+            assert!(t.is_none(), "intermediate seek packet {i} must have no trim");
+        }
+        let last_seek_trim = last_seek_trim.expect("last Vorbis packet after seek must carry AudioTrim");
+        assert_eq!(last_seek_trim.skip_samples, 0);
+        assert_eq!(last_seek_trim.discard_padding, expected_discard);
+    }
 }

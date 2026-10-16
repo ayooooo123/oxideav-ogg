@@ -34,7 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opus streams declare the 48 kHz rate Opus decodes at, not OpusHead's
   informational input rate (a decoder asked for 44.1 kHz output refused
   the stream).
-- Vorbis timestamps after a seek: an unanchored end-of-stream page is anchored
+- Vorbis timestamps and end trimming: the stream's final packet carries its end
+  padding as an audio trim, as FFmpeg's demuxer does, so playback ends where the
+  page granule says; an unanchored end-of-stream page after a seek is anchored
   at the stream's previous page granule looked up lazily, matching the
   uninterrupted timeline without padding shift; a seek onto a file whose only
   data page is the end-of-stream page resumes with the first packet priming

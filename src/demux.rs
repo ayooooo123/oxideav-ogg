@@ -3801,7 +3801,14 @@ impl OggDemuxer {
                     page.is_last(),
                 )
             } else if let Some(timing) = stream.vorbis.as_mut() {
-                (timing.packet(&data), None)
+                let sample_rate = self.streams[public_index].params.sample_rate.unwrap_or(48_000);
+                let (pts, padding) = timing.packet(&data, page.granule_position, page.is_last() && is_last);
+                let trim = padding.map(|discard| AudioTrim {
+                    skip_samples: 0,
+                    discard_padding: discard,
+                    sample_rate,
+                });
+                (pts, trim)
             } else {
                 (pts, None)
             };

@@ -151,16 +151,30 @@ impl VorbisTs {
         self.end = Some(granule - total);
     }
 
-    /// The pts of `packet`, the next data packet. A packet nothing places
-    /// gets none.
-    pub(crate) fn packet(&mut self, packet: &[u8]) -> Option<i64> {
+    /// The pts and optional end padding of `packet`, the next data packet.
+    /// `page_granule` and `is_eos_packet` (true only for the last packet completing
+    /// on an EOS page) determine end padding: pts + duration - granule when positive.
+    pub(crate) fn packet(
+        &mut self,
+        packet: &[u8],
+        page_granule: i64,
+        is_eos_packet: bool,
+    ) -> (Option<i64>, Option<u32>) {
         let mut previous = self.previous;
         let duration = i64::from(self.duration(&mut previous, packet).unwrap_or(0));
         self.previous = previous;
         let first = std::mem::take(&mut self.first);
         let start = self.end.or(first.then_some(-duration));
         self.end = start.map(|s| s.saturating_add(duration));
-        start
+        let padding = if is_eos_packet && places(page_granule) {
+            start.and_then(|pts| {
+                let diff = pts + duration - page_granule;
+                (diff > 0).then_some(diff as u32)
+            })
+        } else {
+            None
+        };
+        (start, padding)
     }
 
     /// A page with data packets ended: its granule is where they end.
