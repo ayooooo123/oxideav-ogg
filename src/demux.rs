@@ -449,6 +449,9 @@ struct LogicalStream {
     /// For Opus: the next data packet is the stream's first after its
     /// headers, which skips the pre-skip (`opus_trim`). Not after a seek.
     opus_first: bool,
+    /// For Vorbis once its headers parse: the packets' timestamps
+    /// (`vorbis_ts`, from FFmpeg's vorbis_parser.c and Ogg demuxer).
+    vorbis: Option<crate::vorbis_ts::VorbisTs>,
     /// How the stream's packets and granules are read.
     layout: Layout,
     /// OGM audio cut without regard to frames (`ogm::audio_framer`).
@@ -756,8 +759,8 @@ impl OggDemuxer {
     }
 
     /// Reset packet state to read on from `offset`. The packets of an Opus
-    /// stream's end-of-stream page cannot be placed from that page alone:
-    /// its granule excludes the padding they carry. When the page at
+    /// or Vorbis stream's end-of-stream page cannot be placed from that page
+    /// alone: its granule excludes the padding they carry. When the page at
     /// `offset` is one, they start at the granule of the stream's page
     /// before it ([`previous_granule`]); any other first page places its
     /// own packets.
@@ -772,11 +775,16 @@ impl OggDemuxer {
             if let Some(framer) = state.framer.as_mut() {
                 framer.reset();
             }
-            state.opus_end = if eos_serial == Some(serial) && self.opus_pre_skip.contains_key(&serial) {
+            let opus = self.opus_pre_skip.contains_key(&serial);
+            let resume = if eos_serial == Some(serial) && (opus || state.vorbis.is_some()) {
                 previous_granule(self.input.as_mut(), offset, serial)?
             } else {
                 None
             };
+            state.opus_end = if opus { resume } else { None };
+            if let Some(vorbis) = state.vorbis.as_mut() {
+                vorbis.seek(resume);
+            }
         }
         self.input.seek(SeekFrom::Start(offset))?;
         self.eof_reached = false;
@@ -2443,6 +2451,7 @@ impl OggDemuxer {
         state.bos_processed = false;
         state.opus_end = None;
         state.opus_first = true;
+        state.vorbis = None;
         state.layout = layout;
         state.framer = framer;
         true
@@ -2707,6 +2716,7 @@ impl OggDemuxer {
                 vp8_next: None,
                 opus_end: None,
                 opus_first: true,
+                vorbis: None,
                 layout,
                 framer: None,
                 continues,
@@ -3473,6 +3483,7 @@ impl OggDemuxer {
         let stream_idx = self.streams[public_index].index;
         let time_base = self.streams[public_index].time_base;
         let opus = self.streams[public_index].params.codec_id.as_str() == "opus";
+        let vorbis = self.streams[public_index].params.codec_id.as_str() == "vorbis";
         let segs = page.packet_segments();
         let was_continued = page.is_continued();
 
@@ -3649,6 +3660,18 @@ impl OggDemuxer {
                 &completed[header_take..],
             );
         }
+        // Vorbis timestamps (`vorbis_ts`): the block sizes and modes come
+        // from the headers, once the last of them is on this page.
+        if vorbis && header_take > 0 && stream.vorbis.is_none() {
+            let headers: Vec<&[u8]> =
+                stream.header_packets.iter().chain(&completed[..header_take]).map(Vec::as_slice).collect();
+            if let [id, _, setup] = headers[..] {
+                stream.vorbis = crate::vorbis_ts::VorbisTs::new(id, setup);
+            }
+        }
+        if let Some(timing) = stream.vorbis.as_mut() {
+            timing.begin_page(page.granule_position, page.is_last(), &completed[header_take..]);
+        }
         // VP8 (`vp8`): the page's first frame starts as many shown frames
         // before the pts its granule names as the page holds; on the
         // end-of-stream page the count runs on from the page before.
@@ -3751,7 +3774,8 @@ impl OggDemuxer {
                 (pts, keyframe)
             };
             // Opus derives every packet's pts from its TOC durations
-            // (`opus_trim`), FFmpeg's timestamps.
+            // (`opus_trim`), Vorbis from its block sizes (`vorbis_ts`):
+            // FFmpeg's timestamps.
             let (pts, trim) = if opus {
                 crate::opus_trim::packet(
                     &mut stream.opus_end,
@@ -3761,6 +3785,8 @@ impl OggDemuxer {
                     page.granule_position,
                     page.is_last(),
                 )
+            } else if let Some(timing) = stream.vorbis.as_mut() {
+                (timing.packet(&data), None)
             } else {
                 (pts, None)
             };
@@ -3806,6 +3832,9 @@ impl OggDemuxer {
         }
         if opus {
             crate::opus_trim::end_page(&mut stream.opus_end, page.granule_position, data_count > 0);
+        }
+        if let Some(timing) = stream.vorbis.as_mut() {
+            timing.end_page(page.granule_position, data_count > 0);
         }
         if stream.layout == Layout::Vp8 && vp8_pts.is_some() {
             stream.vp8_next = vp8_pts;
