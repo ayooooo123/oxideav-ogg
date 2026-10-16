@@ -718,6 +718,8 @@ pub struct OggDemuxer {
     /// does not let the demuxer outlive the loan), so post-open
     /// registrations fall back to the built-in table.
     resolver: Option<Arc<dyn CodecResolver + Send + Sync>>,
+    /// Byte offset of the page currently being parsed or processed.
+    current_page_offset: u64,
 }
 
 impl OggDemuxer {
@@ -755,6 +757,7 @@ impl OggDemuxer {
             stream_end: HashMap::new(),
             theora_granule: HashMap::new(),
             resolver: None,
+            current_page_offset: 0,
         }
     }
 
@@ -2804,6 +2807,7 @@ impl OggDemuxer {
                 // means a subsequent seek can skip bisection if the target
                 // falls inside the already-scanned range.
                 self.index_record(page.serial, page.granule_position, page_off);
+                self.current_page_offset = page_off;
                 Ok(Some(page))
             }
             Err(Error::InvalidData(_)) | Err(Error::Unsupported(_)) => {
@@ -2885,6 +2889,7 @@ impl OggDemuxer {
                             Some(page.seq_no),
                         );
                         self.index_record(page.serial, page.granule_position, candidate_off);
+                        self.current_page_offset = candidate_off;
                         return Ok(Some(page));
                     }
                     None => {
@@ -3667,6 +3672,16 @@ impl OggDemuxer {
                 stream.header_packets.iter().chain(&completed[..header_take]).map(Vec::as_slice).collect();
             if let [id, _, setup] = headers[..] {
                 stream.vorbis = crate::vorbis_ts::VorbisTs::new(id, setup);
+            }
+        }
+        if vorbis && page.is_last() {
+            if let Some(timing) = stream.vorbis.as_mut() {
+                if timing.is_unanchored() {
+                    let cur_pos = self.input.stream_position()?;
+                    let prev = previous_granule(self.input.as_mut(), self.current_page_offset, page.serial)?;
+                    self.input.seek(SeekFrom::Start(cur_pos))?;
+                    timing.anchor_eos(prev);
+                }
             }
         }
         if let Some(timing) = stream.vorbis.as_mut() {

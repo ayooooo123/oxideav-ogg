@@ -23,9 +23,9 @@
 //!   On the stream's first page, an end-of-stream granule leaves out the
 //!   padding of its last packet, so that page places nothing: the
 //!   stream's first packet then starts as above. After a seek, if there is
-//!   a previous page granule ([`VorbisTs::seek`]) packets start there;
-//!   otherwise an unanchored end-of-stream page is placed from its granule
-//!   less its packets' durations, matching FFmpeg's post-seek timestamps.
+//!   a previous page granule ([`VorbisTs::seek`], or lazily looked up for
+//!   an unanchored end-of-stream page), packets start there, matching the
+//!   uninterrupted timeline without padding shift.
 //! - A zero granule places nothing either: it is the first page's, holding
 //!   the priming packet alone, or a broken file's, which FFmpeg distrusts.
 //! A short block does not say how long the block before it was, so when a
@@ -176,6 +176,18 @@ impl VorbisTs {
         self.first = resume == Some(0);
         self.end = resume.filter(|&g| g > 0);
         self.previous = self.blocksize[0];
+    }
+    /// Whether this stream currently has no anchor for its timeline.
+    pub(crate) fn is_unanchored(&self) -> bool {
+        self.end.is_none() && !self.first
+    }
+
+    /// Anchor an end-of-stream page at `resume`, the granule of the stream's
+    /// previous page. If there is no previous data page (0 or None), it is
+    /// the stream's only data page and resumes with priming before 0.
+    pub(crate) fn anchor_eos(&mut self, resume: Option<i64>) {
+        self.first = resume == Some(0) || resume.is_none();
+        self.end = resume.filter(|&g| g > 0);
     }
 }
 

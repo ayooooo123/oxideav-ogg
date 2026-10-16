@@ -122,17 +122,31 @@ fn ensure_theora_vorbis_fixture() -> PathBuf {
 }
 
 /// Finding 1: In a multiplexed file, seeking onto a video page before the Vorbis EOS page
-/// causes all Vorbis packets on that EOS page to have pts None.
-/// After the fix: every Vorbis packet after the seek has a Some(pts).
+/// causes all Vorbis packets on that EOS page to be placed at the previous page's granule,
+/// matching uninterrupted playback.
 #[test]
 fn finding_1_seek_into_last_second_vorbis_pts() {
     let path = ensure_theora_vorbis_fixture();
+
+    // Straight-through reference: collect all Vorbis packet pts.
     let file = File::open(&path).expect("open file");
     let input: Box<dyn ReadSeek> = Box::new(file);
-    let mut d = oxideav_ogg::demux::open(input, &NullCodecResolver).unwrap();
+    let mut d_fresh = oxideav_ogg::demux::open(input, &NullCodecResolver).unwrap();
+    let mut straight_through_pts = Vec::new();
+    while let Ok(pkt) = d_fresh.next_packet() {
+        if pkt.stream_index == 1 {
+            straight_through_pts.push(pkt.pts);
+        }
+    }
+    // The Vorbis EOS page contains the final 39 packets of the stream.
+    assert!(straight_through_pts.len() >= 39);
+    let eos_straight_through = &straight_through_pts[straight_through_pts.len() - 39..];
 
     // Seek to video frame 144 (at 5.76s), which lands on video page at 161393.
     // The Vorbis EOS page follows at offset 168351.
+    let file = File::open(&path).expect("open file");
+    let input: Box<dyn ReadSeek> = Box::new(file);
+    let mut d = oxideav_ogg::demux::open(input, &NullCodecResolver).unwrap();
     d.seek_to(0, 144).unwrap();
 
     let mut vorbis_pts = Vec::new();
@@ -141,10 +155,8 @@ fn finding_1_seek_into_last_second_vorbis_pts() {
             vorbis_pts.push(pkt.pts);
         }
     }
-    assert!(!vorbis_pts.is_empty(), "must have Vorbis packets after seek");
-    for (i, pts) in vorbis_pts.iter().enumerate() {
-        assert!(pts.is_some(), "packet {i} has None pts after seek into last second");
-    }
+    assert_eq!(vorbis_pts.len(), eos_straight_through.len(), "must demux all EOS packets");
+    assert_eq!(vorbis_pts, eos_straight_through, "EOS packets after seek must match uninterrupted timeline exactly");
 }
 
 /// Verify 2: On an EOS page without end trim, unanchored seek pts equal straight-through pts.
