@@ -3703,9 +3703,14 @@ impl OggDemuxer {
             if let Some(timing) = stream.vorbis.as_mut() {
                 if timing.is_unanchored() {
                     let cur_pos = self.input.stream_position()?;
+                    // Go back to where reading stood whether or not the
+                    // lookup worked; a failed seek back is an error too,
+                    // since reading on from inside the lookup window would
+                    // emit this page again.
                     let prev = previous_granule(self.input.as_mut(), self.current_page_offset, page.serial);
-                    let _ = self.input.seek(SeekFrom::Start(cur_pos));
+                    let restored = self.input.seek(SeekFrom::Start(cur_pos));
                     let prev = prev?;
+                    restored?;
                     timing.anchor_eos(prev);
                 }
             }

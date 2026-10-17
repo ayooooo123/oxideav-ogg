@@ -1,5 +1,7 @@
 use std::fs::File;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::path::PathBuf;
 use std::process::Command;
 use oxideav_core::{Demuxer, NullCodecResolver, ReadSeek};
@@ -361,6 +363,76 @@ fn f1_vorbis_eos_anchored_when_previous_page_within_window() {
         }
     }
     assert_eq!(vorbis_pts, &[Some(256), Some(832)]);
+}
+
+/// Input that fails one seek to `fail_at` once armed: the seek back to where
+/// reading stood after the lazy backward lookup.
+struct FailOneSeek {
+    inner: Cursor<Vec<u8>>,
+    fail_at: u64,
+    armed: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+}
+
+impl Read for FailOneSeek {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for FailOneSeek {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        if to == SeekFrom::Start(self.fail_at) && self.armed.swap(false, Ordering::SeqCst) {
+            self.failed.store(true, Ordering::SeqCst);
+            return Err(std::io::Error::other("injected seek failure"));
+        }
+        self.inner.seek(to)
+    }
+}
+
+/// If the input can't go back to where it was after the lazy backward
+/// lookup for an end-of-stream page, the error is returned. Swallowing it
+/// left the demuxer reading from inside the lookup window, and the
+/// end-of-stream page came out twice, the copy past the stream's end.
+#[test]
+fn a_failed_seek_back_after_the_eos_lookup_is_an_error() {
+    let mut stream_bytes = Vec::new();
+    stream_bytes.extend(page_of(SERIAL, flags::FIRST_PAGE, 0, 0, &[id_header()]));
+    stream_bytes.extend(page_of(OPUS_SERIAL, flags::FIRST_PAGE, 0, 0, &[opus_head()]));
+    stream_bytes.extend(page_of(SERIAL, 0, 0, 1, &[comment_header(), setup_header()]));
+    stream_bytes.extend(page_of(OPUS_SERIAL, 0, 0, 1, &[opus_tags()]));
+    stream_bytes.extend(page_of(SERIAL, 0, 256, 2, &[short(), short()]));
+    for i in 2..4 {
+        let granule = (i as i64) * 960;
+        stream_bytes.extend(page_of(OPUS_SERIAL, 0, granule, i as u32, &[vec![0xF8; 100]]));
+    }
+    // The last page, so reading stands at the stream's end when it is read.
+    stream_bytes.extend(page_of(SERIAL, flags::LAST_PAGE, 1856, 3, &[long(false), long(true)]));
+
+    let armed = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicBool::new(false));
+    let input = FailOneSeek {
+        fail_at: stream_bytes.len() as u64,
+        inner: Cursor::new(stream_bytes),
+        armed: Arc::clone(&armed),
+        failed: Arc::clone(&failed),
+    };
+    let mut d = oxideav_ogg::demux::open(Box::new(input), &NullCodecResolver).unwrap();
+    let opus_idx = d.streams().iter().find(|s| s.params.codec_id.as_str() == "opus").unwrap().index;
+    let vorbis_idx = d.streams().iter().find(|s| s.params.codec_id.as_str() == "vorbis").unwrap().index;
+    d.seek_to(opus_idx, 3 * 960).unwrap();
+    armed.store(true, Ordering::SeqCst);
+
+    let mut vorbis_packets = 0;
+    let error = loop {
+        match d.next_packet() {
+            Ok(pkt) => vorbis_packets += usize::from(pkt.stream_index == vorbis_idx),
+            Err(e) => break e,
+        }
+    };
+    assert!(failed.load(Ordering::SeqCst), "the seek back was not attempted");
+    assert!(matches!(error, oxideav_core::Error::Io(_)), "expected the seek error, got {error:?}");
+    assert_eq!(vorbis_packets, 0, "no Vorbis packet may come out of a page read from the wrong place");
 }
 
 /// F2: Seeking to 0 on a healthy file must not bump link count, increment duplicate_serials,
